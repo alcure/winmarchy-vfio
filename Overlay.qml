@@ -7,7 +7,7 @@ import qs.Commons
 import qs.Ui
 
 // Facelock-shaped tile: a card drops under the bar, scans, then checks or shakes.
-// Enter encerra os apps na RTX, sobe o Windows 11 e tenta reabri-los uma vez.
+// Enter libera a RTX e sobe VFIO; S inicia o mesmo Windows com vídeo SPICE.
 Item {
   id: root
 
@@ -16,37 +16,80 @@ Item {
   readonly property string pluginId: manifest && manifest.id ? String(manifest.id) : "psycrow.winmarchy"
   readonly property string pluginDir: String(Qt.resolvedUrl(".")).replace(/^file:\/\//, "").replace(/\/$/, "")
   readonly property string gateBin: pluginDir + "/bin/gate"
+  readonly property string homeDir: Quickshell.env("HOME") || ""
+  readonly property string configPath: homeDir + "/.config/omarchy/winmarchy-vfio.json"
+  property string locale: {
+    var lang = String(Quickshell.env("LANG") || "").toLowerCase()
+    if (lang.indexOf("pt") === 0) return "pt-BR"
+    return "en-US"
+  }
+  property var strings: ({})
+
+  function normalizeLocale(value) {
+    var raw = String(value || "").trim().replace("_", "-")
+    var lower = raw.toLowerCase()
+    if (lower.indexOf("pt") === 0) return "pt-BR"
+    if (lower.indexOf("en") === 0) return "en-US"
+    if (raw === "pt-BR" || raw === "en-US") return raw
+    return ""
+  }
+
+  function detectLocale() {
+    var forced = normalizeLocale(Quickshell.env("WIN11_VFIO_LOCALE"))
+    if (forced) return forced
+    if (configFile.text()) {
+      var data = parseJson(configFile.text())
+      forced = normalizeLocale(data.locale)
+      if (forced) return forced
+    }
+    forced = normalizeLocale(Quickshell.env("LANG"))
+    return forced || "en-US"
+  }
+
+  function loadStrings() {
+    locale = detectLocale()
+    var parsed = parseJson(stringsFile.text())
+    if (parsed && typeof parsed === "object" && !parsed.error) strings = parsed
+  }
+
+  function tr(key) {
+    if (strings && strings[key]) return strings[key]
+    return key
+  }
 
   property bool opened: false
   property string phase: "scan"   // scan | confirm | go | ok | fail | blocked
   property string errorText: ""
   property var groups: []
   property bool fatal: false
+  property string goMode: "vfio"
   property color green: "#34c759"
 
   readonly property bool scanning: phase === "scan" || phase === "go"
   readonly property color tone: phase === "ok" ? green : (phase === "fail" || phase === "blocked") ? Color.urgent : Color.accent
   readonly property string uiFont: Style.font.family
-  readonly property int hudWidth: Style.space(248)
+  readonly property int hudWidth: Style.space(268)
   readonly property int glyphSize: Style.space(78)
   readonly property string glyphIcon: "\u{F05B3}"
 
-  readonly property string title: phase === "ok" ? "Windows 11 ready"
-    : phase === "fail" ? "Não iniciou"
-    : phase === "blocked" ? "RTX ocupada"
-    : phase === "go" ? "Handing off GPU"
-    : phase === "confirm" ? "Release RTX?"
-    : "Scanning GPU"
+  readonly property string title: phase === "ok" ? (goMode === "shared" ? tr("title_ok_shared") : tr("title_ok_vfio"))
+    : phase === "fail" ? tr("title_fail")
+    : phase === "blocked" ? tr("title_blocked")
+    : phase === "go" ? (goMode === "shared" ? tr("title_go_shared") : tr("title_go_vfio"))
+    : phase === "confirm" && fatal ? tr("title_confirm_fatal")
+    : phase === "confirm" ? tr("title_confirm")
+    : tr("title_scan")
 
-  readonly property string subtitle: phase === "ok" ? "Apps reabertos uma vez"
-    : phase === "fail" ? (errorText || "Use a senha no terminal")
-    : phase === "blocked" ? "Saia da sessão e volte na Intel"
-    : phase === "go" ? "Encerrar · iniciar · restaurar"
-    : phase === "confirm" ? processLine
-    : "Looking for GPU holders"
+  readonly property string subtitle: phase === "ok" ? (goMode === "shared" ? tr("sub_ok_shared") : tr("sub_ok_vfio"))
+    : phase === "fail" ? (errorText || tr("sub_fail_fallback"))
+    : phase === "blocked" ? tr("sub_blocked")
+    : phase === "go" ? (goMode === "shared" ? tr("sub_go_shared") : tr("sub_go_vfio"))
+    : phase === "confirm" && fatal ? tr("sub_confirm_fatal")
+    : phase === "confirm" ? (groups && groups.length ? processLine : tr("sub_confirm_free"))
+    : tr("sub_scan")
 
   readonly property string processLine: {
-    if (!groups || groups.length === 0) return "Nada segurando a placa"
+    if (!groups || groups.length === 0) return tr("process_none")
     var names = []
     for (var i = 0; i < groups.length; i++) names.push(groups[i].label)
     return names.join(" · ")
@@ -56,10 +99,17 @@ Item {
     errorText = ""
     groups = []
     fatal = false
+    goMode = "vfio"
     phase = "scan"
     opened = true
     successAnim.stop(); failAnim.stop()
     frame.morph = 0; frame.check = 0; hud.shakeX = 0; hud.pop = 1; ripple.progress = 0
+    var payload = parseJson(payloadJson)
+    if (payload && payload.mode === "shared") {
+      goNow("shared")
+      Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+      return
+    }
     Qt.callLater(function() { keyCatcher.forceActiveFocus(); kick(holdersProc) })
   }
 
@@ -83,37 +133,37 @@ Item {
 
   function applyHolders(raw) {
     var data = parseJson(raw)
-    if (!data.ok) { failWith(data.error || "Falha ao ler a GPU."); return }
+    if (!data.ok) { failWith(data.error || tr("err_gpu_read")); return }
     groups = data.groups || []
     fatal = !!data.fatal
-    if (fatal) {
-      phase = "blocked"
-      failAnim.restart()
-      return
-    }
-    if (groups.length === 0) {
-      goNow()
-      return
-    }
     phase = "confirm"
+    if (fatal) failAnim.restart()
   }
 
-  function goNow() {
+  function goNow(mode) {
     if (phase === "go" || phase === "ok") return
-    if (fatal) return
+    var chosen = mode || "vfio"
+    if (chosen === "vfio" && fatal) return
+    goMode = chosen
     phase = "go"
+    goProc.command = ["/usr/bin/python3", root.gateBin, "go", chosen]
     kick(goProc)
   }
 
   function applyGo(raw) {
     var data = parseJson(raw)
     if (!data.ok) {
-      failWith(data.error || "A VM não iniciou.")
+      failWith(data.error || tr("err_vm_start"))
       return
     }
+    if (data.mode) goMode = data.mode
     phase = "ok"
     successAnim.restart()
-    Quickshell.execDetached(["/usr/bin/env", "LIBVA_DRIVER_NAME=iHD", "__GLX_VENDOR_LIBRARY_NAME=mesa", "__EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json", "looking-glass-client"])
+    if (goMode === "shared") {
+      Quickshell.execDetached(["/usr/bin/virt-viewer", "-c", "qemu:///system", "--attach", "--wait", "win11-shared"])
+    } else {
+      Quickshell.execDetached(["/usr/bin/env", "LIBVA_DRIVER_NAME=iHD", "__GLX_VENDOR_LIBRARY_NAME=mesa", "__EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json", "looking-glass-client"])
+    }
     hideTimer.interval = 1600
     hideTimer.restart()
   }
@@ -129,6 +179,27 @@ Item {
   Timer {
     id: hideTimer
     onTriggered: root.dismiss()
+  }
+
+  FileView {
+    id: configFile
+    path: root.configPath
+    watchChanges: true
+    printErrors: false
+    onFileChanged: reload()
+    onLoaded: {
+      root.locale = root.detectLocale()
+      stringsFile.reload()
+    }
+  }
+
+  FileView {
+    id: stringsFile
+    path: root.pluginDir + "/i18n/" + root.locale + ".json"
+    watchChanges: true
+    printErrors: false
+    onFileChanged: reload()
+    onLoaded: root.loadStrings()
   }
 
   FileView {
@@ -186,18 +257,18 @@ Item {
     stdout: StdioCollector { id: holdersOut; waitForEnd: true }
     stderr: StdioCollector { id: holdersErr; waitForEnd: true }
     onExited: function(code) {
-      if (code !== 0 && !holdersOut.text) root.failWith(holdersErr.text || "holders falhou")
+      if (code !== 0 && !holdersOut.text) root.failWith(holdersErr.text || root.tr("err_holders"))
       else root.applyHolders(holdersOut.text)
     }
   }
 
   Process {
     id: goProc
-    command: ["/usr/bin/python3", root.gateBin, "go"]
+    command: ["/usr/bin/python3", root.gateBin, "go", root.goMode]
     stdout: StdioCollector { id: goOut; waitForEnd: true }
     stderr: StdioCollector { id: goErr; waitForEnd: true }
     onExited: function(code) {
-      if (code !== 0 && !goOut.text) root.failWith(goErr.text || "gate falhou")
+      if (code !== 0 && !goOut.text) root.failWith(goErr.text || root.tr("err_gate"))
       else root.applyGo(goOut.text)
     }
   }
@@ -228,7 +299,10 @@ Item {
           if (root.phase === "confirm" || root.phase === "fail" || root.phase === "blocked") root.dismiss()
           event.accepted = true
         } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
-          if (root.phase === "confirm") root.goNow()
+          if (root.phase === "confirm") root.goNow("vfio")
+          event.accepted = true
+        } else if (event.key === Qt.Key_S) {
+          if (root.phase === "confirm") root.goNow("shared")
           event.accepted = true
         }
       }
@@ -483,7 +557,7 @@ Item {
             Text {
               anchors.verticalCenter: parent.verticalCenter
               textFormat: Text.PlainText
-              text: "WIN11 VFIO"
+              text: root.goMode === "shared" ? "WIN11 SPICE" : "WIN11 VFIO"
               font.family: root.uiFont
               font.pixelSize: Style.font.caption
               font.bold: true
@@ -495,28 +569,56 @@ Item {
 
         Item { width: 1; height: Style.space(10); visible: root.phase === "confirm" }
 
-        Rectangle {
+        Column {
           visible: root.phase === "confirm"
           anchors.horizontalCenter: parent.horizontalCenter
-          width: goLabel.implicitWidth + Style.space(20)
-          height: goLabel.implicitHeight + Style.space(10)
-          radius: Style.cornerRadius
-          color: Util.alpha(Color.accent, 0.16)
-          border.width: 1
-          border.color: Util.alpha(Color.accent, 0.55)
-          Text {
-            id: goLabel
-            anchors.centerIn: parent
-            text: "Enter · encerrar e iniciar"
-            font.family: root.uiFont
-            font.pixelSize: Style.font.bodySmall
-            font.bold: true
-            color: Color.popups.text
+          spacing: Style.space(6)
+
+          Rectangle {
+            visible: !root.fatal
+            width: Math.max(vfioLabel.implicitWidth + Style.space(20), spiceLabel.implicitWidth + Style.space(20))
+            height: vfioLabel.implicitHeight + Style.space(10)
+            radius: Style.cornerRadius
+            color: Util.alpha(Color.accent, 0.16)
+            border.width: 1
+            border.color: Util.alpha(Color.accent, 0.55)
+            Text {
+              id: vfioLabel
+              anchors.centerIn: parent
+              text: root.groups && root.groups.length ? root.tr("btn_vfio_busy") : root.tr("btn_vfio_free")
+              font.family: root.uiFont
+              font.pixelSize: Style.font.bodySmall
+              font.bold: true
+              color: Color.popups.text
+            }
+            MouseArea {
+              anchors.fill: parent
+              cursorShape: Qt.PointingHandCursor
+              onClicked: root.goNow("vfio")
+            }
           }
-          MouseArea {
-            anchors.fill: parent
-            cursorShape: Qt.PointingHandCursor
-            onClicked: root.goNow()
+
+          Rectangle {
+            width: Math.max(vfioLabel.implicitWidth + Style.space(20), spiceLabel.implicitWidth + Style.space(20))
+            height: spiceLabel.implicitHeight + Style.space(10)
+            radius: Style.cornerRadius
+            color: Util.alpha(Color.popups.text, 0.06)
+            border.width: 1
+            border.color: Util.alpha(Color.popups.text, 0.22)
+            Text {
+              id: spiceLabel
+              anchors.centerIn: parent
+              text: root.tr("btn_shared")
+              font.family: root.uiFont
+              font.pixelSize: Style.font.bodySmall
+              font.bold: true
+              color: Color.popups.text
+            }
+            MouseArea {
+              anchors.fill: parent
+              cursorShape: Qt.PointingHandCursor
+              onClicked: root.goNow("shared")
+            }
           }
         }
       }
@@ -526,6 +628,7 @@ Item {
   IpcHandler {
     target: "winmarchy-vfio"
     function start(): string { root.open("{}"); return "ok" }
+    function shared(): string { root.open("{\"mode\":\"shared\"}"); return "ok" }
     function hide(): string { root.dismiss(); return "ok" }
   }
 }

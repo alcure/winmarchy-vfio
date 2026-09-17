@@ -4,5 +4,9 @@ if [[ ${1:-start} == start ]]; then
   if out=$(omarchy-shell shell summon psycrow.winmarchy '{}' 2>/dev/null) && [[ $out == ok ]]; then
     exit 0
   fi
+elif [[ ${1:-} == shared ]]; then
+  if out=$(omarchy-shell shell summon psycrow.winmarchy '{"mode":"shared"}' 2>/dev/null) && [[ $out == ok ]]; then
+    exit 0
+  fi
 fi
 exec /usr/local/bin/win11-vfio "$@"

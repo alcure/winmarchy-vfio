@@ -2,11 +2,11 @@
   "schemaVersion": 1,
   "id": "psycrow.winmarchy",
   "name": "Winmarchy VFIO",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "author": "psycrow",
   "license": "MIT",
   "homepage": "https://github.com/alcure/winmarchy-vfio",
-  "description": "Overlay do Omarchy: lista processos na RTX, pede confirmação, inicia o Windows 11 VFIO e tenta restaurar os apps.",
+  "description": "Omarchy overlay: VFIO + Looking Glass or the same Windows 11 over shared SPICE. Overlay do Omarchy: VFIO com Looking Glass ou o mesmo Windows 11 em vídeo SPICE. Languages: pt-BR, en-US.",
   "kinds": ["overlay"],
   "keepLoaded": true,
   "entryPoints": {

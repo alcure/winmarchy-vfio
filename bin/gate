@@ -13,7 +13,13 @@ from pathlib import Path
 
 GPU = os.environ.get("WIN11_VFIO_GPU", "0000:01:00.0")
 VM = os.environ.get("WIN11_VFIO_VM", "win11")
+VM_SHARED = os.environ.get("WIN11_VFIO_VM_SHARED", "win11-shared")
+PLUGIN_DIR = Path(__file__).resolve().parent.parent
+CONFIG = Path.home() / ".config/omarchy/winmarchy-vfio.json"
 STATE = Path.home() / ".local/state/omarchy/winmarchy-vfio.json"
+QEMU_NS = "http://libvirt.org/schemas/domain/qemu/1.0"
+TPM_STATE = f"/var/lib/libvirt/swtpm/{os.environ.get('WIN11_VFIO_UUID', '489b869a-5b61-4be1-bf63-94db23193370')}"
+SUPPORTED = {"pt-BR", "en-US"}
 
 IGNORED = {
     "omarchy-shell",
@@ -28,6 +34,49 @@ IGNORED = {
     "python3",
     "gate",
 }
+
+
+def normalize_locale(value: str | None) -> str | None:
+    if not value:
+        return None
+    raw = value.strip().replace("_", "-")
+    lower = raw.lower()
+    if lower.startswith("pt"):
+        return "pt-BR"
+    if lower.startswith("en"):
+        return "en-US"
+    if raw in SUPPORTED:
+        return raw
+    return None
+
+
+def locale_id() -> str:
+    forced = normalize_locale(os.environ.get("WIN11_VFIO_LOCALE"))
+    if forced:
+        return forced
+    if CONFIG.exists():
+        try:
+            forced = normalize_locale(json.loads(CONFIG.read_text()).get("locale"))
+            if forced:
+                return forced
+        except (OSError, json.JSONDecodeError):
+            pass
+    return normalize_locale(os.environ.get("LANG")) or "en-US"
+
+
+def load_strings() -> dict:
+    path = PLUGIN_DIR / "i18n" / f"{locale_id()}.json"
+    fallback = PLUGIN_DIR / "i18n" / "en-US.json"
+    data = {}
+    for candidate in (fallback, path):
+        if candidate.exists():
+            data.update(json.loads(candidate.read_text()))
+    return data
+
+
+def t(key: str, **kwargs) -> str:
+    text = load_strings().get(key, key)
+    return text.format(**kwargs) if kwargs else text
 
 
 def gpu_paths() -> list[str]:
@@ -101,12 +150,12 @@ def classify(proc: dict) -> str | None:
 
 
 LABELS = {
-    "hyprland": "Hyprland (compositor)",
-    "omarchy-shell": "Omarchy Shell",
-    "steam": "Steam",
-    "nautilus": "Arquivos (Nautilus)",
-    "voxtype": "Voxtype",
-    "ollama": "Ollama",
+    "hyprland": "label_hyprland",
+    "omarchy-shell": "label_shell",
+    "steam": "label_steam",
+    "nautilus": "label_nautilus",
+    "voxtype": "label_voxtype",
+    "ollama": "label_ollama",
 }
 
 STOP = {
@@ -139,7 +188,7 @@ def groups_from_procs(procs: list[dict]) -> list[dict]:
             stop = None
             start = members[0]["argv"] or [members[0]["exe"]]
         else:
-            label = LABELS.get(gid, gid)
+            label = t(LABELS[gid]) if gid in LABELS else gid
             stop = STOP.get(gid)
             start = START.get(gid)
             fatal = gid in {"hyprland", "omarchy-shell"}
@@ -203,7 +252,7 @@ def release(groups: list[dict]) -> dict:
     errors = []
     for g in groups:
         if g.get("fatal"):
-            errors.append(f"{g['label']} não pode ser encerrado daqui.")
+            errors.append(t("cannot_stop", label=g["label"]))
             continue
         gid = g.get("id")
         try:
@@ -271,43 +320,173 @@ def restore(groups: list[dict] | None = None) -> dict:
     return {"ok": not errors, "started": started, "errors": errors}
 
 
-def start_vm() -> dict:
+def _virsh(*args: str, timeout: float = 20) -> subprocess.CompletedProcess:
+    return run(["/usr/bin/virsh", "-c", "qemu:///system", *args], timeout=timeout)
+
+
+def _domstate(name: str) -> str:
+    return (_virsh("domstate", name, timeout=10).stdout or "").strip()
+
+
+def _other_profile_running(mode: str) -> str | None:
+    other = VM_SHARED if mode == "vfio" else VM
+    if _domstate(other) == "running":
+        return other
+    return None
+
+
+def _shared_uuid() -> str:
+    proc = _virsh("domuuid", VM_SHARED, timeout=10)
+    if proc.returncode == 0 and proc.stdout.strip():
+        return proc.stdout.strip()
+    import uuid
+
+    return str(uuid.uuid4())
+
+
+def _tag(el) -> str:
+    return el.tag.rsplit("}", 1)[-1]
+
+
+def build_shared_xml(source_xml: str) -> str:
+    import xml.etree.ElementTree as ET
+
+    ET.register_namespace("qemu", QEMU_NS)
+    root = ET.fromstring(source_xml)
+    name = root.find("name")
+    if name is not None:
+        name.text = VM_SHARED
+    title = root.find("title")
+    if title is not None:
+        title.text = t("shared_title")
+    uuid_el = root.find("uuid")
+    if uuid_el is not None:
+        uuid_el.text = _shared_uuid()
+    devices = root.find("devices")
+    if devices is not None:
+        for hd in list(devices.findall("hostdev")):
+            if hd.get("type") == "pci":
+                devices.remove(hd)
+        for graphics in devices.findall("graphics"):
+            if graphics.get("type") == "spice":
+                graphics.set("autoport", "yes")
+                graphics.attrib.pop("port", None)
+        tpm_backend = devices.find("./tpm/backend")
+        if tpm_backend is not None:
+            tpm_backend.set("persistent_state", "yes")
+            source = tpm_backend.find("source")
+            if source is None:
+                source = ET.SubElement(tpm_backend, "source")
+            source.set("path", TPM_STATE)
+    for child in list(root):
+        if _tag(child) == "commandline":
+            root.remove(child)
+    return ET.tostring(root, encoding="unicode")
+
+
+def ensure_shared_domain() -> dict:
+    dumped = _virsh("dumpxml", VM, "--inactive", timeout=15)
+    if dumped.returncode != 0:
+        return {"ok": False, "error": (dumped.stderr or dumped.stdout or t("read_win11")).strip()}
+    xml = build_shared_xml(dumped.stdout)
+    proc = subprocess.run(
+        ["/usr/bin/virsh", "-c", "qemu:///system", "define", "/dev/stdin"],
+        input=xml,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    if proc.returncode != 0:
+        import xml.etree.ElementTree as ET
+
+        root = ET.fromstring(xml)
+        backend = root.find("./devices/tpm/backend")
+        if backend is not None:
+            backend.attrib.pop("persistent_state", None)
+            source = backend.find("source")
+            if source is not None:
+                backend.remove(source)
+            xml = ET.tostring(root, encoding="unicode")
+            proc = subprocess.run(
+                ["/usr/bin/virsh", "-c", "qemu:///system", "define", "/dev/stdin"],
+                input=xml,
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+    if proc.returncode != 0:
+        return {"ok": False, "error": (proc.stderr or proc.stdout or t("define_shared")).strip()}
+    log("defined win11-shared")
+    return {"ok": True}
+
+
+def start_vm(mode: str = "vfio") -> dict:
+    mode = "shared" if mode == "shared" else "vfio"
+    target = VM_SHARED if mode == "shared" else VM
+    other = _other_profile_running(mode)
+    if other:
+        return {"ok": False, "error": t("other_running", name=other)}
+    if mode == "shared":
+        ensured = ensure_shared_domain()
+        if not ensured.get("ok"):
+            return ensured
+        if _domstate(target) == "running":
+            return {"ok": True, "state": "running", "mode": mode, "vm": target}
+        proc = _virsh("start", target, timeout=90)
+        if proc.returncode == 0 or "already active" in (proc.stderr or "").lower():
+            log("virsh start shared ok")
+            return {"ok": True, "state": "running", "mode": mode, "vm": target}
+        return {"ok": False, "error": (proc.stderr or proc.stdout or t("start_shared")).strip()}
+
     last = ""
     for attempt in range(8):
         still = holders_payload()
         blocking = [g for g in still["groups"] if not g["fatal"]]
         if blocking:
-            last = "A RTX ainda está em uso: " + ", ".join(g["label"] for g in blocking)
+            last = t("rtx_in_use", names=", ".join(g["label"] for g in blocking))
             log(f"start wait {attempt}: {last}")
             time.sleep(0.6)
             continue
-        proc = run(["/usr/bin/virsh", "-c", "qemu:///system", "start", VM], timeout=90)
+        proc = _virsh("start", target, timeout=90)
         if proc.returncode == 0:
-            log("virsh start ok")
-            return {"ok": True, "state": "running"}
-        last = (proc.stderr or proc.stdout or "falha ao iniciar").strip()
+            log("virsh start vfio ok")
+            return {"ok": True, "state": "running", "mode": mode, "vm": target}
+        last = (proc.stderr or proc.stdout or t("vm_fail")).strip()
         log(f"virsh start fail: {last}")
         if "already active" in last.lower():
-            return {"ok": True, "state": "running"}
+            return {"ok": True, "state": "running", "mode": mode, "vm": target}
         time.sleep(0.7)
-    return {"ok": False, "error": last or "A RTX ainda está em uso."}
+    return {"ok": False, "error": last or t("rtx_busy")}
 
 
-def go() -> dict:
+def go(mode: str = "vfio") -> dict:
+    mode = "shared" if mode == "shared" else "vfio"
     holders = holders_payload()
+    if mode == "shared":
+        started = start_vm("shared")
+        if started.get("ok"):
+            return {"ok": True, "phase": "ok", "mode": "shared", "vm": VM_SHARED, "released": [], "restored": []}
+        return {
+            "ok": False,
+            "phase": "fail",
+            "mode": "shared",
+            "error": started.get("error") or t("shared_vm_fail"),
+        }
     if holders["fatal"]:
-        return {"ok": False, "phase": "blocked", "error": "Hyprland ainda está na RTX.", "holders": holders}
+        return {"ok": False, "phase": "blocked", "error": t("hyprland_on_rtx"), "holders": holders}
     groups = [g for g in holders["groups"] if not g["fatal"]]
     released = {"released": groups, "ok": True, "errors": []}
     if groups:
         released = release(groups)
-    started = start_vm()
+    started = start_vm("vfio")
     restored = {"started": [], "ok": True}
     if started.get("ok"):
         restored = restore(released.get("released") or groups)
         return {
             "ok": True,
             "phase": "ok",
+            "mode": "vfio",
+            "vm": VM,
             "released": [g.get("id") for g in (released.get("released") or [])],
             "restored": restored.get("started"),
             "errors": (released.get("errors") or []) + (restored.get("errors") or []),
@@ -316,19 +495,22 @@ def go() -> dict:
     return {
         "ok": False,
         "phase": "fail",
-        "error": started.get("error") or "A VM não iniciou.",
+        "mode": "vfio",
+        "error": started.get("error") or t("vm_fail"),
         "holders": started.get("holders") or holders_payload(),
         "errors": released.get("errors") or [],
     }
 
 
 def vm_state() -> dict:
-    proc = run(["virsh", "-c", "qemu:///system", "domstate", VM], timeout=10)
-    return {"ok": proc.returncode == 0, "state": (proc.stdout or "").strip(), "error": (proc.stderr or "").strip()}
+    vfio = _domstate(VM)
+    shared = _domstate(VM_SHARED)
+    return {"ok": True, "vfio": vfio, "shared": shared, "state": vfio or shared}
 
 
 def main() -> int:
     cmd = sys.argv[1] if len(sys.argv) > 1 else "holders"
+    mode = sys.argv[2] if len(sys.argv) > 2 else "vfio"
     if cmd == "holders":
         json.dump(holders_payload(), sys.stdout, ensure_ascii=False)
         sys.stdout.write("\n")
@@ -344,18 +526,22 @@ def main() -> int:
         sys.stdout.write("\n")
         return 0
     if cmd == "go":
-        json.dump(go(), sys.stdout, ensure_ascii=False)
+        json.dump(go(mode), sys.stdout, ensure_ascii=False)
         sys.stdout.write("\n")
         return 0
     if cmd == "start-vm":
-        json.dump(start_vm(), sys.stdout, ensure_ascii=False)
+        json.dump(start_vm(mode), sys.stdout, ensure_ascii=False)
+        sys.stdout.write("\n")
+        return 0
+    if cmd == "ensure-shared":
+        json.dump(ensure_shared_domain(), sys.stdout, ensure_ascii=False)
         sys.stdout.write("\n")
         return 0
     if cmd == "vm-state":
         json.dump(vm_state(), sys.stdout, ensure_ascii=False)
         sys.stdout.write("\n")
         return 0
-    print("uso: gate {holders|release|restore|start-vm|vm-state}", file=sys.stderr)
+    print(t("usage"), file=sys.stderr)
     return 2
 
 

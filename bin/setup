@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+plugin_dir="$(cd "$(dirname "$0")/.." && pwd)"
+config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy"
+config="$config_dir/winmarchy-vfio.json"
+
+normalize() {
+  case ${1,,} in
+    pt|pt-br|pt_br|pt-br*|português*|portugues*) echo pt-BR ;;
+    en|en-us|en_us|en-us*|english*) echo en-US ;;
+    *) return 1 ;;
+  esac
+}
+
+pick=""
+while (( $# > 0 )); do
+  case "$1" in
+    --locale)
+      pick=$(normalize "${2:-}") || { echo "unsupported locale: ${2:-}" >&2; exit 2; }
+      shift 2
+      ;;
+    -h|--help)
+      echo "Usage: setup [--locale pt-BR|en-US]"
+      exit 0
+      ;;
+    *)
+      echo "Usage: setup [--locale pt-BR|en-US]" >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [[ -z $pick ]]; then
+  if [[ -t 0 && -t 1 ]] && command -v gum >/dev/null 2>&1; then
+    choice=$(gum choose --header "Winmarchy language / idioma" "Português (Brasil)" "English (US)") || exit 1
+    case $choice in
+      Português*) pick=pt-BR ;;
+      *) pick=en-US ;;
+    esac
+  elif [[ -t 0 && -t 1 ]]; then
+    echo "1) Português (Brasil)"
+    echo "2) English (US)"
+    read -r -p "Language / idioma [1/2]: " answer
+    case $answer in
+      2|en|EN|en-US) pick=en-US ;;
+      *) pick=pt-BR ;;
+    esac
+  else
+    if [[ ${LANG:-} == pt* ]]; then
+      pick=pt-BR
+    else
+      pick=en-US
+    fi
+  fi
+fi
+
+mkdir -p "$config_dir"
+python3 - "$config" "$pick" <<'PY'
+import json, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+locale = sys.argv[2]
+data = {}
+if path.exists():
+    try:
+        data = json.loads(path.read_text())
+    except json.JSONDecodeError:
+        data = {}
+data["locale"] = locale
+path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+PY
+
+saved=$(python3 - "$plugin_dir" "$pick" <<'PY'
+import json, pathlib, sys
+locale = sys.argv[2]
+text = (pathlib.Path(sys.argv[1]) / "i18n" / f"{locale}.json").read_text()
+print(json.loads(text)["setup_saved"].format(locale=locale))
+PY
+)
+echo "$saved"
