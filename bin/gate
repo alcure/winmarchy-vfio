@@ -1,0 +1,363 @@
+#!/usr/bin/env python3
+"""GPU holders for the Winmarchy VFIO Omarchy overlay."""
+from __future__ import annotations
+
+import glob
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+GPU = os.environ.get("WIN11_VFIO_GPU", "0000:01:00.0")
+VM = os.environ.get("WIN11_VFIO_VM", "win11")
+STATE = Path.home() / ".local/state/omarchy/winmarchy-vfio.json"
+
+IGNORED = {
+    "omarchy-shell",
+    "Xwayland",
+    "pipewire",
+    "pipewire-pulse",
+    "wireplumber",
+    "dbus-daemon",
+    "systemd",
+    "looking-glass-client",
+    "qemu-system-x86_64",
+    "python3",
+    "gate",
+}
+
+
+def gpu_paths() -> list[str]:
+    found: list[str] = []
+    for pattern in ("/dev/nvidia*", f"/dev/dri/by-path/pci-{GPU}-*"):
+        for raw in glob.glob(pattern):
+            if os.path.exists(raw):
+                found.append(os.path.realpath(raw))
+                found.append(raw)
+    # unique preserve order
+    out: list[str] = []
+    for p in found:
+        if p not in out:
+            out.append(p)
+    return out
+
+
+def proc_meta(pid: int) -> dict | None:
+    try:
+        comm = Path(f"/proc/{pid}/comm").read_text().strip()
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+        argv = [a.decode("utf-8", "replace") for a in raw if a]
+        exe = os.readlink(f"/proc/{pid}/exe")
+    except OSError:
+        return None
+    return {"pid": pid, "comm": comm, "argv": argv, "exe": exe}
+
+
+def pids_on_gpu() -> list[dict]:
+    paths = set(gpu_paths())
+    basenames = {os.path.basename(p) for p in paths}
+    holders: dict[int, dict] = {}
+    for ent in os.listdir("/proc"):
+        if not ent.isdigit():
+            continue
+        pid = int(ent)
+        fd_dir = f"/proc/{pid}/fd"
+        try:
+            for fd in os.listdir(fd_dir):
+                try:
+                    tgt = os.readlink(f"{fd_dir}/{fd}")
+                except OSError:
+                    continue
+                real = os.path.realpath(tgt) if tgt.startswith("/") else tgt
+                name = os.path.basename(tgt)
+                if tgt in paths or real in paths or name in basenames:
+                    meta = proc_meta(pid)
+                    if meta:
+                        holders[pid] = meta
+                    break
+        except OSError:
+            continue
+    return list(holders.values())
+
+
+def classify(proc: dict) -> str | None:
+    blob = " ".join([proc["comm"], proc.get("exe", ""), *proc.get("argv", [])]).lower()
+    if proc["comm"] in IGNORED or "omarchy-shell" in blob:
+        return None
+    if "hyprland" in blob:
+        return "hyprland"
+    if "steamwebhelper" in blob or "/steam" in blob or proc["comm"] in {"steam", "steamwebhelper"}:
+        return "steam"
+    if "nautilus" in blob:
+        return "nautilus"
+    if "voxtype" in blob:
+        return "voxtype"
+    if "ollama" in blob:
+        return "ollama"
+    return f"pid:{proc['pid']}"
+
+
+LABELS = {
+    "hyprland": "Hyprland (compositor)",
+    "omarchy-shell": "Omarchy Shell",
+    "steam": "Steam",
+    "nautilus": "Arquivos (Nautilus)",
+    "voxtype": "Voxtype",
+    "ollama": "Ollama",
+}
+
+STOP = {
+    "steam": ["steam", "-shutdown"],
+    "nautilus": ["nautilus", "--quit"],
+    "voxtype": ["systemctl", "--user", "stop", "voxtype.service"],
+    "ollama": ["systemctl", "stop", "ollama.service"],
+}
+
+START = {
+    "steam": ["/usr/bin/steam", "-silent"],
+    "nautilus": ["/usr/bin/nautilus"],
+    "voxtype": ["/usr/bin/systemctl", "--user", "start", "voxtype.service"],
+    "ollama": ["/usr/bin/systemctl", "start", "ollama.service"],
+}
+
+
+def groups_from_procs(procs: list[dict]) -> list[dict]:
+    buckets: dict[str, list[dict]] = {}
+    for proc in procs:
+        gid = classify(proc)
+        if not gid:
+            continue
+        buckets.setdefault(gid, []).append(proc)
+    groups = []
+    for gid, members in buckets.items():
+        fatal = gid in {"hyprland", "omarchy-shell"} or gid.split(":")[0] in {"hyprland"}
+        if gid.startswith("pid:"):
+            label = members[0]["comm"]
+            stop = None
+            start = members[0]["argv"] or [members[0]["exe"]]
+        else:
+            label = LABELS.get(gid, gid)
+            stop = STOP.get(gid)
+            start = START.get(gid)
+            fatal = gid in {"hyprland", "omarchy-shell"}
+        groups.append(
+            {
+                "id": gid,
+                "label": label,
+                "fatal": fatal,
+                "pids": [m["pid"] for m in members],
+                "comms": sorted({m["comm"] for m in members}),
+                "stop": stop,
+                "start": start,
+            }
+        )
+    groups.sort(key=lambda g: (not g["fatal"], g["label"].lower()))
+    return groups
+
+
+def holders_payload() -> dict:
+    procs = pids_on_gpu()
+    groups = groups_from_procs(procs)
+    return {
+        "ok": True,
+        "gpu": GPU,
+        "count": len(groups),
+        "fatal": any(g["fatal"] for g in groups),
+        "groups": groups,
+    }
+
+
+def run(cmd: list[str], timeout: float = 20) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+
+
+def log(msg: str) -> None:
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    with (STATE.parent / "winmarchy-vfio.log").open("a") as fh:
+        fh.write(f"{time.strftime('%H:%M:%S')} {msg}\n")
+
+
+def kill_pid(pid: int) -> None:
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def wait_gone(matcher, seconds: float = 8) -> None:
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        left = [p for p in pids_on_gpu() if matcher(p)]
+        if not left:
+            return
+        for p in left:
+            kill_pid(p["pid"])
+        time.sleep(0.35)
+
+
+def release(groups: list[dict]) -> dict:
+    released = []
+    errors = []
+    for g in groups:
+        if g.get("fatal"):
+            errors.append(f"{g['label']} não pode ser encerrado daqui.")
+            continue
+        gid = g.get("id")
+        try:
+            if gid == "steam":
+                run(["/usr/bin/steam", "-shutdown"], timeout=12)
+                wait_gone(lambda p: classify(p) == "steam", 10)
+                run(["/usr/bin/pkill", "-TERM", "-x", "steam"], timeout=5)
+                run(["/usr/bin/pkill", "-TERM", "-x", "steamwebhelper"], timeout=5)
+            elif gid == "nautilus":
+                run(["/usr/bin/nautilus", "--quit"], timeout=8)
+                wait_gone(lambda p: classify(p) == "nautilus", 6)
+            elif gid == "voxtype":
+                run(["/usr/bin/systemctl", "--user", "stop", "voxtype.service"], timeout=8)
+                wait_gone(lambda p: classify(p) == "voxtype", 6)
+            elif g.get("stop"):
+                run(g["stop"], timeout=15)
+        except Exception as exc:
+            errors.append(f"{g['label']}: {exc}")
+        for pid in g.get("pids", []):
+            kill_pid(int(pid))
+        released.append(g)
+        log(f"released {gid} pids={g.get('pids')}")
+    wait_gone(lambda p: classify(p) not in {None, "hyprland"}, 8)
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    STATE.write_text(json.dumps({"groups": released, "at": time.time()}, indent=2))
+    still = holders_payload()
+    blocking = [g for g in still["groups"] if not g["fatal"]]
+    return {
+        "ok": not blocking,
+        "released": released,
+        "still": still,
+        "errors": errors,
+    }
+
+
+def restore(groups: list[dict] | None = None) -> dict:
+    if groups is None:
+        if STATE.exists():
+            groups = json.loads(STATE.read_text()).get("groups", [])
+        else:
+            groups = []
+    started = []
+    errors = []
+    env = os.environ.copy()
+    env["LIBVA_DRIVER_NAME"] = "iHD"
+    env["__GLX_VENDOR_LIBRARY_NAME"] = "mesa"
+    env["__EGL_VENDOR_LIBRARY_FILENAMES"] = "/usr/share/glvnd/egl_vendor.d/50_mesa.json"
+    for g in groups:
+        start = g.get("start")
+        if not start:
+            continue
+        cmd = list(start)
+        if cmd and cmd[0] == "steam":
+            cmd[0] = "/usr/bin/steam"
+        if cmd and cmd[0] == "nautilus":
+            cmd[0] = "/usr/bin/nautilus"
+        try:
+            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env, start_new_session=True)
+            started.append(g["id"])
+            log(f"restore once {g['id']}: {cmd}")
+        except Exception as exc:
+            errors.append(f"{g.get('label', g['id'])}: {exc}")
+    if STATE.exists():
+        STATE.unlink()
+    return {"ok": not errors, "started": started, "errors": errors}
+
+
+def start_vm() -> dict:
+    last = ""
+    for attempt in range(8):
+        still = holders_payload()
+        blocking = [g for g in still["groups"] if not g["fatal"]]
+        if blocking:
+            last = "A RTX ainda está em uso: " + ", ".join(g["label"] for g in blocking)
+            log(f"start wait {attempt}: {last}")
+            time.sleep(0.6)
+            continue
+        proc = run(["/usr/bin/virsh", "-c", "qemu:///system", "start", VM], timeout=90)
+        if proc.returncode == 0:
+            log("virsh start ok")
+            return {"ok": True, "state": "running"}
+        last = (proc.stderr or proc.stdout or "falha ao iniciar").strip()
+        log(f"virsh start fail: {last}")
+        if "already active" in last.lower():
+            return {"ok": True, "state": "running"}
+        time.sleep(0.7)
+    return {"ok": False, "error": last or "A RTX ainda está em uso."}
+
+
+def go() -> dict:
+    holders = holders_payload()
+    if holders["fatal"]:
+        return {"ok": False, "phase": "blocked", "error": "Hyprland ainda está na RTX.", "holders": holders}
+    groups = [g for g in holders["groups"] if not g["fatal"]]
+    released = {"released": groups, "ok": True, "errors": []}
+    if groups:
+        released = release(groups)
+    started = start_vm()
+    restored = {"started": [], "ok": True}
+    if started.get("ok"):
+        restored = restore(released.get("released") or groups)
+        return {
+            "ok": True,
+            "phase": "ok",
+            "released": [g.get("id") for g in (released.get("released") or [])],
+            "restored": restored.get("started"),
+            "errors": (released.get("errors") or []) + (restored.get("errors") or []),
+        }
+    restore(released.get("released") or groups)
+    return {
+        "ok": False,
+        "phase": "fail",
+        "error": started.get("error") or "A VM não iniciou.",
+        "holders": started.get("holders") or holders_payload(),
+        "errors": released.get("errors") or [],
+    }
+
+
+def vm_state() -> dict:
+    proc = run(["virsh", "-c", "qemu:///system", "domstate", VM], timeout=10)
+    return {"ok": proc.returncode == 0, "state": (proc.stdout or "").strip(), "error": (proc.stderr or "").strip()}
+
+
+def main() -> int:
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "holders"
+    if cmd == "holders":
+        json.dump(holders_payload(), sys.stdout, ensure_ascii=False)
+        sys.stdout.write("\n")
+        return 0
+    if cmd == "release":
+        payload = json.loads(sys.stdin.read() or "{}")
+        json.dump(release(payload.get("groups") or holders_payload()["groups"]), sys.stdout, ensure_ascii=False)
+        sys.stdout.write("\n")
+        return 0
+    if cmd == "restore":
+        payload = json.loads(sys.stdin.read() or "{}") if not sys.stdin.isatty() else {}
+        json.dump(restore(payload.get("groups")), sys.stdout, ensure_ascii=False)
+        sys.stdout.write("\n")
+        return 0
+    if cmd == "go":
+        json.dump(go(), sys.stdout, ensure_ascii=False)
+        sys.stdout.write("\n")
+        return 0
+    if cmd == "start-vm":
+        json.dump(start_vm(), sys.stdout, ensure_ascii=False)
+        sys.stdout.write("\n")
+        return 0
+    if cmd == "vm-state":
+        json.dump(vm_state(), sys.stdout, ensure_ascii=False)
+        sys.stdout.write("\n")
+        return 0
+    print("uso: gate {holders|release|restore|start-vm|vm-state}", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

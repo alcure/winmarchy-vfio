@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "id": "psycrow.winmarchy",
+  "name": "Winmarchy VFIO",
+  "version": "1.0.0",
+  "author": "psycrow",
+  "license": "MIT",
+  "homepage": "https://github.com/alcure/winmarchy-vfio",
+  "description": "Overlay do Omarchy: lista processos na RTX, pede confirmação, inicia o Windows 11 VFIO e tenta restaurar os apps.",
+  "kinds": ["overlay"],
+  "keepLoaded": true,
+  "entryPoints": {
+    "overlay": "Overlay.qml"
+  }
+}
