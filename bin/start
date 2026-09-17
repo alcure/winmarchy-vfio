@@ -1,5 +1,6 @@
 #!/bin/bash
 set -euo pipefail
+plugin_dir="$(cd "$(dirname "$0")" && pwd)"
 if [[ ${1:-start} == start ]]; then
   if out=$(omarchy-shell shell summon psycrow.winmarchy '{}' 2>/dev/null) && [[ $out == ok ]]; then
     exit 0
@@ -8,5 +9,11 @@ elif [[ ${1:-} == shared ]]; then
   if out=$(omarchy-shell shell summon psycrow.winmarchy '{"mode":"shared"}' 2>/dev/null) && [[ $out == ok ]]; then
     exit 0
   fi
+  python3 "$plugin_dir/gate" start-vm shared >/tmp/winmarchy-shared.json
+  python3 -c 'import json,sys; d=json.load(open("/tmp/winmarchy-shared.json")); sys.exit(0 if d.get("ok") else 1)' || {
+    python3 -c 'import json; print(json.load(open("/tmp/winmarchy-shared.json")).get("error","falha"))' >&2
+    exit 1
+  }
+  exec "$plugin_dir/view-lg"
 fi
 exec /usr/local/bin/win11-vfio "$@"

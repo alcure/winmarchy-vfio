@@ -18,12 +18,42 @@ Item {
   readonly property string gateBin: pluginDir + "/bin/gate"
   readonly property string homeDir: Quickshell.env("HOME") || ""
   readonly property string configPath: homeDir + "/.config/omarchy/winmarchy-vfio.json"
-  property string locale: {
-    var lang = String(Quickshell.env("LANG") || "").toLowerCase()
-    if (lang.indexOf("pt") === 0) return "pt-BR"
-    return "en-US"
-  }
+  property string locale: "pt-BR"
   property var strings: ({})
+  readonly property var bundled: ({
+    "pt-BR": {
+      "title_confirm": "Como abrir o W11?",
+      "title_confirm_fatal": "VFIO indisponível",
+      "title_scan": "Lendo a GPU",
+      "sub_pick": "VFIO usa a RTX; Looking Glass sem passthrough deixa a placa no Linux.",
+      "sub_confirm_free": "RTX livre · escolha o perfil",
+      "sub_scan": "Procurando quem segura a GPU",
+      "process_none": "Nada segurando a placa",
+      "btn_vfio": "Enter · VFIO + Looking Glass",
+      "btn_vfio_hint_busy": "Encerra o que está na RTX",
+      "btn_vfio_hint_free": "Passthrough da RTX",
+      "btn_shared": "S · Looking Glass (RTX no Linux)",
+      "btn_shared_hint": "Mesmo visor, sem exclusividade da GPU",
+      "err_gpu_read": "Falha ao ler a GPU.",
+      "err_vm_start": "A VM não iniciou."
+    },
+    "en-US": {
+      "title_confirm": "How should Windows 11 start?",
+      "title_confirm_fatal": "VFIO unavailable",
+      "title_scan": "Scanning GPU",
+      "sub_pick": "VFIO uses the RTX; Looking Glass without passthrough leaves it on Linux.",
+      "sub_confirm_free": "RTX is free · pick a profile",
+      "sub_scan": "Looking for GPU holders",
+      "process_none": "Nothing is holding the GPU",
+      "btn_vfio": "Enter · VFIO + Looking Glass",
+      "btn_vfio_hint_busy": "Stops whatever is using the RTX",
+      "btn_vfio_hint_free": "RTX passthrough",
+      "btn_shared": "S · Looking Glass (RTX on Linux)",
+      "btn_shared_hint": "Same viewer, GPU stays on the host",
+      "err_gpu_read": "Could not read the GPU.",
+      "err_vm_start": "The VM did not start."
+    }
+  })
 
   function normalizeLocale(value) {
     var raw = String(value || "").trim().replace("_", "-")
@@ -43,17 +73,20 @@ Item {
       if (forced) return forced
     }
     forced = normalizeLocale(Quickshell.env("LANG"))
-    return forced || "en-US"
+    return forced || "pt-BR"
   }
 
   function loadStrings() {
-    locale = detectLocale()
+    var next = detectLocale()
+    if (locale !== next) locale = next
     var parsed = parseJson(stringsFile.text())
     if (parsed && typeof parsed === "object" && !parsed.error) strings = parsed
   }
 
   function tr(key) {
     if (strings && strings[key]) return strings[key]
+    var pack = bundled[locale] || bundled["pt-BR"]
+    if (pack && pack[key]) return pack[key]
     return key
   }
 
@@ -68,7 +101,7 @@ Item {
   readonly property bool scanning: phase === "scan" || phase === "go"
   readonly property color tone: phase === "ok" ? green : (phase === "fail" || phase === "blocked") ? Color.urgent : Color.accent
   readonly property string uiFont: Style.font.family
-  readonly property int hudWidth: Style.space(268)
+  readonly property int hudWidth: Style.space(340)
   readonly property int glyphSize: Style.space(78)
   readonly property string glyphIcon: "\u{F05B3}"
 
@@ -85,7 +118,8 @@ Item {
     : phase === "blocked" ? tr("sub_blocked")
     : phase === "go" ? (goMode === "shared" ? tr("sub_go_shared") : tr("sub_go_vfio"))
     : phase === "confirm" && fatal ? tr("sub_confirm_fatal")
-    : phase === "confirm" ? (groups && groups.length ? processLine : tr("sub_confirm_free"))
+    : phase === "confirm" && groups && groups.length ? (processLine + " — " + tr("sub_pick"))
+    : phase === "confirm" ? tr("sub_confirm_free")
     : tr("sub_scan")
 
   readonly property string processLine: {
@@ -160,7 +194,7 @@ Item {
     phase = "ok"
     successAnim.restart()
     if (goMode === "shared") {
-      Quickshell.execDetached(["/usr/bin/virt-viewer", "-c", "qemu:///system", "--attach", "--wait", "win11-shared"])
+      Quickshell.execDetached([root.pluginDir + "/bin/view-lg"])
     } else {
       Quickshell.execDetached(["/usr/bin/env", "LIBVA_DRIVER_NAME=iHD", "__GLX_VENDOR_LIBRARY_NAME=mesa", "__EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json", "looking-glass-client"])
     }
@@ -363,6 +397,7 @@ Item {
 
       Column {
         id: content
+        width: hud.width - Style.space(32)
         anchors.horizontalCenter: parent.horizontalCenter
         anchors.top: parent.top
         anchors.topMargin: Style.space(24)
@@ -508,7 +543,7 @@ Item {
           anchors.horizontalCenter: parent.horizontalCenter
           textFormat: Text.PlainText
           text: root.title
-          width: root.hudWidth - Style.space(28)
+          width: parent.width
           horizontalAlignment: Text.AlignHCenter
           fontSizeMode: Text.HorizontalFit
           minimumPixelSize: Math.round(Style.font.bodySmall)
@@ -524,7 +559,7 @@ Item {
           anchors.horizontalCenter: parent.horizontalCenter
           textFormat: Text.PlainText
           text: root.subtitle
-          width: root.hudWidth - Style.space(24)
+          width: parent.width
           wrapMode: Text.Wrap
           horizontalAlignment: Text.AlignHCenter
           font.family: root.uiFont
@@ -557,7 +592,7 @@ Item {
             Text {
               anchors.verticalCenter: parent.verticalCenter
               textFormat: Text.PlainText
-              text: root.goMode === "shared" ? "WIN11 SPICE" : "WIN11 VFIO"
+              text: root.goMode === "shared" ? "WIN11 LG" : "WIN11 VFIO"
               font.family: root.uiFont
               font.pixelSize: Style.font.caption
               font.bold: true
@@ -571,25 +606,42 @@ Item {
 
         Column {
           visible: root.phase === "confirm"
-          anchors.horizontalCenter: parent.horizontalCenter
-          spacing: Style.space(6)
+          width: parent.width
+          spacing: Style.space(8)
 
           Rectangle {
             visible: !root.fatal
-            width: Math.max(vfioLabel.implicitWidth + Style.space(20), spiceLabel.implicitWidth + Style.space(20))
-            height: vfioLabel.implicitHeight + Style.space(10)
+            width: parent.width
+            height: vfioCol.implicitHeight + Style.space(12)
             radius: Style.cornerRadius
             color: Util.alpha(Color.accent, 0.16)
             border.width: 1
             border.color: Util.alpha(Color.accent, 0.55)
-            Text {
-              id: vfioLabel
+            Column {
+              id: vfioCol
               anchors.centerIn: parent
-              text: root.groups && root.groups.length ? root.tr("btn_vfio_busy") : root.tr("btn_vfio_free")
-              font.family: root.uiFont
-              font.pixelSize: Style.font.bodySmall
-              font.bold: true
-              color: Color.popups.text
+              width: parent.width - Style.space(16)
+              spacing: Style.space(2)
+              Text {
+                width: parent.width
+                wrapMode: Text.Wrap
+                horizontalAlignment: Text.AlignHCenter
+                text: root.tr("btn_vfio")
+                font.family: root.uiFont
+                font.pixelSize: Style.font.bodySmall
+                font.bold: true
+                color: Color.popups.text
+              }
+              Text {
+                width: parent.width
+                wrapMode: Text.Wrap
+                horizontalAlignment: Text.AlignHCenter
+                visible: text.length > 0
+                text: root.groups && root.groups.length ? root.tr("btn_vfio_hint_busy") : root.tr("btn_vfio_hint_free")
+                font.family: root.uiFont
+                font.pixelSize: Style.font.caption
+                color: Util.alpha(Color.popups.text, 0.7)
+              }
             }
             MouseArea {
               anchors.fill: parent
@@ -599,20 +651,36 @@ Item {
           }
 
           Rectangle {
-            width: Math.max(vfioLabel.implicitWidth + Style.space(20), spiceLabel.implicitWidth + Style.space(20))
-            height: spiceLabel.implicitHeight + Style.space(10)
+            width: parent.width
+            height: spiceCol.implicitHeight + Style.space(12)
             radius: Style.cornerRadius
-            color: Util.alpha(Color.popups.text, 0.06)
+            color: Util.alpha(Color.accent, 0.10)
             border.width: 1
-            border.color: Util.alpha(Color.popups.text, 0.22)
-            Text {
-              id: spiceLabel
+            border.color: Util.alpha(Color.accent, 0.45)
+            Column {
+              id: spiceCol
               anchors.centerIn: parent
-              text: root.tr("btn_shared")
-              font.family: root.uiFont
-              font.pixelSize: Style.font.bodySmall
-              font.bold: true
-              color: Color.popups.text
+              width: parent.width - Style.space(16)
+              spacing: Style.space(2)
+              Text {
+                width: parent.width
+                wrapMode: Text.Wrap
+                horizontalAlignment: Text.AlignHCenter
+                text: root.tr("btn_shared")
+                font.family: root.uiFont
+                font.pixelSize: Style.font.bodySmall
+                font.bold: true
+                color: Color.popups.text
+              }
+              Text {
+                width: parent.width
+                wrapMode: Text.Wrap
+                horizontalAlignment: Text.AlignHCenter
+                text: root.tr("btn_shared_hint")
+                font.family: root.uiFont
+                font.pixelSize: Style.font.caption
+                color: Util.alpha(Color.popups.text, 0.7)
+              }
             }
             MouseArea {
               anchors.fill: parent

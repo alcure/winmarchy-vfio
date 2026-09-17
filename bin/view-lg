@@ -1,0 +1,6 @@
+#!/bin/bash
+set -euo pipefail
+export LIBVA_DRIVER_NAME=iHD
+export __GLX_VENDOR_LIBRARY_NAME=mesa
+export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json
+exec looking-glass-client -F egl:vsync=no win:jitRender=yes "$@"

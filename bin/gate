@@ -348,6 +348,42 @@ def _tag(el) -> str:
     return el.tag.rsplit("}", 1)[-1]
 
 
+def host_resolution() -> tuple[int, int]:
+    try:
+        env_w, env_h = os.environ.get("WIN11_SPICE_WIDTH"), os.environ.get("WIN11_SPICE_HEIGHT")
+        if env_w and env_h:
+            return int(env_w), int(env_h)
+        out = subprocess.check_output(["/usr/bin/hyprctl", "monitors", "-j"], text=True, timeout=5)
+        mons = json.loads(out)
+        if not mons:
+            return 3440, 1440
+        focused = next((m for m in mons if m.get("focused")), None)
+        pick = focused or max(mons, key=lambda m: int(m.get("width") or 0) * int(m.get("height") or 0))
+        return int(pick.get("width") or 3440), int(pick.get("height") or 1440)
+    except Exception:
+        return 3440, 1440
+
+
+def _set_shared_video(devices, ET) -> None:
+    width, height = host_resolution()
+    for video in list(devices.findall("video")):
+        devices.remove(video)
+    video = ET.SubElement(devices, "video")
+    model = ET.SubElement(video, "model")
+    model.set("type", "virtio")
+    model.set("heads", "1")
+    model.set("primary", "yes")
+    accel = ET.SubElement(model, "acceleration")
+    accel.set("accel3d", "no")
+    res = ET.SubElement(model, "resolution")
+    res.set("x", str(width))
+    res.set("y", str(height))
+    if not any(inp.get("type") == "tablet" for inp in devices.findall("input")):
+        tablet = ET.SubElement(devices, "input")
+        tablet.set("type", "tablet")
+        tablet.set("bus", "usb")
+
+
 def build_shared_xml(source_xml: str) -> str:
     import xml.etree.ElementTree as ET
 
@@ -371,6 +407,21 @@ def build_shared_xml(source_xml: str) -> str:
             if graphics.get("type") == "spice":
                 graphics.set("autoport", "yes")
                 graphics.attrib.pop("port", None)
+                gl = graphics.find("gl")
+                if gl is None:
+                    gl = ET.SubElement(graphics, "gl")
+                gl.set("enable", "no")
+                for tag, key, val in (
+                    ("image", "compression", "off"),
+                    ("jpeg", "compression", "never"),
+                    ("zlib", "compression", "never"),
+                    ("playback", "compression", "off"),
+                ):
+                    el = graphics.find(tag)
+                    if el is None:
+                        el = ET.SubElement(graphics, tag)
+                    el.set(key, val)
+        _set_shared_video(devices, ET)
         tpm_backend = devices.find("./tpm/backend")
         if tpm_backend is not None:
             tpm_backend.set("persistent_state", "yes")
@@ -378,27 +429,28 @@ def build_shared_xml(source_xml: str) -> str:
             if source is None:
                 source = ET.SubElement(tpm_backend, "source")
             source.set("path", TPM_STATE)
-    for child in list(root):
-        if _tag(child) == "commandline":
-            root.remove(child)
     return ET.tostring(root, encoding="unicode")
 
 
-def ensure_shared_domain() -> dict:
-    dumped = _virsh("dumpxml", VM, "--inactive", timeout=15)
-    if dumped.returncode != 0:
-        return {"ok": False, "error": (dumped.stderr or dumped.stdout or t("read_win11")).strip()}
-    xml = build_shared_xml(dumped.stdout)
-    proc = subprocess.run(
+def _virsh_define(xml: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
         ["/usr/bin/virsh", "-c", "qemu:///system", "define", "/dev/stdin"],
         input=xml,
         capture_output=True,
         text=True,
         timeout=20,
     )
-    if proc.returncode != 0:
-        import xml.etree.ElementTree as ET
 
+
+def ensure_shared_domain() -> dict:
+    dumped = _virsh("dumpxml", VM, "--inactive", timeout=15)
+    if dumped.returncode != 0:
+        return {"ok": False, "error": (dumped.stderr or dumped.stdout or t("read_win11")).strip()}
+    import xml.etree.ElementTree as ET
+
+    xml = build_shared_xml(dumped.stdout)
+    proc = _virsh_define(xml)
+    if proc.returncode != 0:
         root = ET.fromstring(xml)
         backend = root.find("./devices/tpm/backend")
         if backend is not None:
@@ -406,18 +458,105 @@ def ensure_shared_domain() -> dict:
             source = backend.find("source")
             if source is not None:
                 backend.remove(source)
-            xml = ET.tostring(root, encoding="unicode")
-            proc = subprocess.run(
-                ["/usr/bin/virsh", "-c", "qemu:///system", "define", "/dev/stdin"],
-                input=xml,
-                capture_output=True,
-                text=True,
-                timeout=20,
-            )
+        xml = ET.tostring(root, encoding="unicode")
+        proc = _virsh_define(xml)
+    if proc.returncode != 0:
+        root = ET.fromstring(xml)
+        for model in root.findall("./devices/video/model"):
+            res = model.find("resolution")
+            if res is not None:
+                model.remove(res)
+        xml = ET.tostring(root, encoding="unicode")
+        proc = _virsh_define(xml)
     if proc.returncode != 0:
         return {"ok": False, "error": (proc.stderr or proc.stdout or t("define_shared")).strip()}
     log("defined win11-shared")
     return {"ok": True}
+
+
+def _guest_agent(vm: str, payload: dict, timeout: float = 20) -> dict | None:
+    proc = run(
+        ["/usr/bin/virsh", "-c", "qemu:///system", "qemu-agent-command", vm, json.dumps(payload)],
+        timeout=timeout,
+    )
+    if proc.returncode != 0:
+        return None
+    try:
+        return json.loads(proc.stdout).get("return")
+    except json.JSONDecodeError:
+        return None
+
+
+def wait_guest_agent(vm: str, seconds: float = 90) -> bool:
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        if _guest_agent(vm, {"execute": "guest-ping"}, timeout=8) is not None:
+            return True
+        time.sleep(2)
+    return False
+
+
+def guest_pshell(vm: str, command: str, timeout: float = 40) -> bool:
+    started = _guest_agent(
+        vm,
+        {
+            "execute": "guest-exec",
+            "arguments": {
+                "path": r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+                "arg": ["-NoProfile", "-Command", command],
+                "capture-output": False,
+            },
+        },
+        timeout=15,
+    )
+    if not started or "pid" not in started:
+        return False
+    pid = started["pid"]
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        status = _guest_agent(vm, {"execute": "guest-exec-status", "arguments": {"pid": pid}}, timeout=10)
+        if status and status.get("exited"):
+            return int(status.get("exitcode") or 1) == 0
+        time.sleep(0.5)
+    return False
+
+
+SHARED_DISPLAY_PS = r"""
+Get-PnpDevice -Class Display -ErrorAction SilentlyContinue |
+  Where-Object { $_.FriendlyName -match 'Virtual Display|Looking Glass|IVSHMEM' -or $_.InstanceId -like 'ROOT\DISPLAY*' } |
+  ForEach-Object { Enable-PnpDevice -InstanceId $_.InstanceId -Confirm:$false -ErrorAction SilentlyContinue }
+"""
+
+VFIO_DISPLAY_PS = r"""
+Get-PnpDevice -Class Display -ErrorAction SilentlyContinue |
+  Where-Object { $_.FriendlyName -match 'Virtual Display|Looking Glass|IVSHMEM' -or $_.InstanceId -like 'ROOT\DISPLAY*' } |
+  ForEach-Object { Enable-PnpDevice -InstanceId $_.InstanceId -Confirm:$false -ErrorAction SilentlyContinue }
+"""
+
+
+def prepare_display(mode: str) -> dict:
+    vm = VM_SHARED if mode == "shared" else VM
+    if _domstate(vm) != "running":
+        return {"ok": False, "error": f"{vm} is not running"}
+    if not wait_guest_agent(vm, 90):
+        log(f"guest agent timeout on {vm}")
+        return {"ok": False, "error": "guest agent timeout"}
+    cmd = SHARED_DISPLAY_PS if mode == "shared" else VFIO_DISPLAY_PS
+    ok = guest_pshell(vm, cmd)
+    log(f"prepare-display {mode} ok={ok}")
+    return {"ok": ok}
+
+
+def spawn_prepare_display(mode: str) -> None:
+    try:
+        subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), "prepare-display", mode],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception as exc:
+        log(f"spawn prepare-display: {exc}")
 
 
 def start_vm(mode: str = "vfio") -> dict:
@@ -431,10 +570,12 @@ def start_vm(mode: str = "vfio") -> dict:
         if not ensured.get("ok"):
             return ensured
         if _domstate(target) == "running":
+            spawn_prepare_display("shared")
             return {"ok": True, "state": "running", "mode": mode, "vm": target}
         proc = _virsh("start", target, timeout=90)
         if proc.returncode == 0 or "already active" in (proc.stderr or "").lower():
             log("virsh start shared ok")
+            spawn_prepare_display("shared")
             return {"ok": True, "state": "running", "mode": mode, "vm": target}
         return {"ok": False, "error": (proc.stderr or proc.stdout or t("start_shared")).strip()}
 
@@ -450,10 +591,12 @@ def start_vm(mode: str = "vfio") -> dict:
         proc = _virsh("start", target, timeout=90)
         if proc.returncode == 0:
             log("virsh start vfio ok")
+            spawn_prepare_display("vfio")
             return {"ok": True, "state": "running", "mode": mode, "vm": target}
         last = (proc.stderr or proc.stdout or t("vm_fail")).strip()
         log(f"virsh start fail: {last}")
         if "already active" in last.lower():
+            spawn_prepare_display("vfio")
             return {"ok": True, "state": "running", "mode": mode, "vm": target}
         time.sleep(0.7)
     return {"ok": False, "error": last or t("rtx_busy")}
@@ -531,6 +674,10 @@ def main() -> int:
         return 0
     if cmd == "start-vm":
         json.dump(start_vm(mode), sys.stdout, ensure_ascii=False)
+        sys.stdout.write("\n")
+        return 0
+    if cmd == "prepare-display":
+        json.dump(prepare_display("shared" if mode == "shared" else "vfio"), sys.stdout, ensure_ascii=False)
         sys.stdout.write("\n")
         return 0
     if cmd == "ensure-shared":
