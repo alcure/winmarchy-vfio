@@ -193,11 +193,7 @@ Item {
     if (data.mode) goMode = data.mode
     phase = "ok"
     successAnim.restart()
-    if (goMode === "shared") {
-      Quickshell.execDetached([root.pluginDir + "/bin/view-lg"])
-    } else {
-      Quickshell.execDetached(["/usr/bin/env", "LIBVA_DRIVER_NAME=iHD", "__GLX_VENDOR_LIBRARY_NAME=mesa", "__EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json", "looking-glass-client"])
-    }
+    Quickshell.execDetached([root.pluginDir + "/bin/view-lg"])
     hideTimer.interval = 1600
     hideTimer.restart()
   }

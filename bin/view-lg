@@ -3,4 +3,49 @@ set -euo pipefail
 export LIBVA_DRIVER_NAME=iHD
 export __GLX_VENDOR_LIBRARY_NAME=mesa
 export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json
-exec looking-glass-client -F egl:vsync=no win:jitRender=yes "$@"
+
+spice_port="$(
+  python3 - <<'PY'
+import subprocess
+import xml.etree.ElementTree as ET
+
+for vm in ("win11-shared", "win11"):
+    state = subprocess.run(
+        ["/usr/bin/virsh", "-c", "qemu:///system", "domstate", vm],
+        capture_output=True,
+        text=True,
+        timeout=8,
+    )
+    if state.stdout.strip() != "running":
+        continue
+    xml = subprocess.check_output(
+        ["/usr/bin/virsh", "-c", "qemu:///system", "dumpxml", vm],
+        text=True,
+        timeout=8,
+    )
+    root = ET.fromstring(xml)
+    for el in root.iter():
+        if el.tag.endswith("graphics") and el.get("type") == "spice":
+            print(el.get("port") or "5900")
+            raise SystemExit
+print("5900")
+PY
+)"
+
+exec looking-glass-client \
+  -F \
+  -m KEY_F12 \
+  egl:vsync=no \
+  win:jitRender=yes \
+  win:keepAspect=no \
+  win:forceAspect=no \
+  win:autoResize=no \
+  input:grabKeyboard=yes \
+  input:grabKeyboardOnFocus=no \
+  input:captureOnFocus=no \
+  input:rawMouse=yes \
+  input:mouseSmoothing=no \
+  spice:port="${spice_port}" \
+  spice:scaleCursor=yes \
+  spice:captureOnStart=no \
+  "$@"

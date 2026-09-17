@@ -63,6 +63,10 @@ Change language later with the same `bin/setup`. The choice is stored in `~/.con
 2. Check the RTX process list.
 3. **Enter** frees the GPU and starts VFIO; **S** starts Looking Glass without passthrough; **Esc** cancels.
 
+**F12** toggles Looking Glass input capture (same in both profiles). Captured: mouse and keyboard stay in Windows. Released: Super/Omarchy shortcuts work on Linux.
+
+Default resolutions: **1920×1080** on VirtIO (`win11-shared`) and **3440×1440** on VFIO (`win11`, Looking Glass / NVIDIA).
+
 CLI: `win11-vfio start` (VFIO) or the plugin `bin/start shared` (Looking Glass, RTX on Linux).
 
 Does not edit `/usr/share/omarchy`.
@@ -103,3 +107,7 @@ Aponte o atalho do Windows 11 para `bin/start`. Idioma em `~/.config/omarchy/win
 1. Abra **Windows 11 (VFIO)**.
 2. Confira o que está na RTX.
 3. **Enter** = VFIO; **S** = Looking Glass com a RTX no Linux; **Esc** cancela.
+
+**F12** trava e destrava a captura (rato e teclado no Windows). Com a captura solta, Super e atalhos do Omarchy voltam ao Linux.
+
+Resoluções padrão: **1920×1080** no VirtIO (`win11-shared`) e **3440×1440** no VFIO (`win11`, Looking Glass / NVIDIA).

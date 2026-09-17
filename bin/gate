@@ -14,6 +14,8 @@ from pathlib import Path
 GPU = os.environ.get("WIN11_VFIO_GPU", "0000:01:00.0")
 VM = os.environ.get("WIN11_VFIO_VM", "win11")
 VM_SHARED = os.environ.get("WIN11_VFIO_VM_SHARED", "win11-shared")
+SHARED_WIDTH, SHARED_HEIGHT = 1920, 1080
+VFIO_WIDTH, VFIO_HEIGHT = 3440, 1440
 PLUGIN_DIR = Path(__file__).resolve().parent.parent
 CONFIG = Path.home() / ".config/omarchy/winmarchy-vfio.json"
 STATE = Path.home() / ".local/state/omarchy/winmarchy-vfio.json"
@@ -348,24 +350,7 @@ def _tag(el) -> str:
     return el.tag.rsplit("}", 1)[-1]
 
 
-def host_resolution() -> tuple[int, int]:
-    try:
-        env_w, env_h = os.environ.get("WIN11_SPICE_WIDTH"), os.environ.get("WIN11_SPICE_HEIGHT")
-        if env_w and env_h:
-            return int(env_w), int(env_h)
-        out = subprocess.check_output(["/usr/bin/hyprctl", "monitors", "-j"], text=True, timeout=5)
-        mons = json.loads(out)
-        if not mons:
-            return 3440, 1440
-        focused = next((m for m in mons if m.get("focused")), None)
-        pick = focused or max(mons, key=lambda m: int(m.get("width") or 0) * int(m.get("height") or 0))
-        return int(pick.get("width") or 3440), int(pick.get("height") or 1440)
-    except Exception:
-        return 3440, 1440
-
-
 def _set_shared_video(devices, ET) -> None:
-    width, height = host_resolution()
     for video in list(devices.findall("video")):
         devices.remove(video)
     video = ET.SubElement(devices, "video")
@@ -376,12 +361,11 @@ def _set_shared_video(devices, ET) -> None:
     accel = ET.SubElement(model, "acceleration")
     accel.set("accel3d", "no")
     res = ET.SubElement(model, "resolution")
-    res.set("x", str(width))
-    res.set("y", str(height))
-    if not any(inp.get("type") == "tablet" for inp in devices.findall("input")):
-        tablet = ET.SubElement(devices, "input")
-        tablet.set("type", "tablet")
-        tablet.set("bus", "usb")
+    res.set("x", str(SHARED_WIDTH))
+    res.set("y", str(SHARED_HEIGHT))
+    for inp in list(devices.findall("input")):
+        if inp.get("type") == "tablet":
+            devices.remove(inp)
 
 
 def build_shared_xml(source_xml: str) -> str:
@@ -405,8 +389,8 @@ def build_shared_xml(source_xml: str) -> str:
                 devices.remove(hd)
         for graphics in devices.findall("graphics"):
             if graphics.get("type") == "spice":
-                graphics.set("autoport", "yes")
-                graphics.attrib.pop("port", None)
+                graphics.set("autoport", "no")
+                graphics.set("port", "5900")
                 gl = graphics.find("gl")
                 if gl is None:
                     gl = ET.SubElement(graphics, "gl")
@@ -522,9 +506,15 @@ def guest_pshell(vm: str, command: str, timeout: float = 40) -> bool:
 
 
 SHARED_DISPLAY_PS = r"""
-Get-PnpDevice -Class Display -ErrorAction SilentlyContinue |
-  Where-Object { $_.FriendlyName -match 'Virtual Display|Looking Glass|IVSHMEM' -or $_.InstanceId -like 'ROOT\DISPLAY*' } |
-  ForEach-Object { Enable-PnpDevice -InstanceId $_.InstanceId -Confirm:$false -ErrorAction SilentlyContinue }
+Get-PnpDevice -Class Display -ErrorAction SilentlyContinue | ForEach-Object {
+  $virtio = $_.FriendlyName -match 'VirtIO|Virtio|Red Hat'
+  $vdd = ($_.FriendlyName -match 'Virtual Display|Looking Glass|IVSHMEM') -or ($_.InstanceId -like 'ROOT\DISPLAY*')
+  if ($virtio) {
+    Enable-PnpDevice -InstanceId $_.InstanceId -Confirm:$false -ErrorAction SilentlyContinue
+  } elseif ($vdd) {
+    Disable-PnpDevice -InstanceId $_.InstanceId -Confirm:$false -ErrorAction SilentlyContinue
+  }
+}
 """
 
 VFIO_DISPLAY_PS = r"""
@@ -542,7 +532,7 @@ def prepare_display(mode: str) -> dict:
         log(f"guest agent timeout on {vm}")
         return {"ok": False, "error": "guest agent timeout"}
     cmd = SHARED_DISPLAY_PS if mode == "shared" else VFIO_DISPLAY_PS
-    ok = guest_pshell(vm, cmd)
+    ok = guest_pshell(vm, cmd, timeout=90)
     log(f"prepare-display {mode} ok={ok}")
     return {"ok": ok}
 
