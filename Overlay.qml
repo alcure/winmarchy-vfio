@@ -25,15 +25,17 @@ Item {
       "title_confirm": "Como abrir o W11?",
       "title_confirm_fatal": "VFIO indisponível",
       "title_scan": "Lendo a GPU",
-      "sub_pick": "VFIO usa a RTX; Looking Glass sem passthrough deixa a placa no Linux.",
-      "sub_confirm_free": "RTX livre · escolha o perfil",
+      "sub_pick": "Dois modos: Enter ou S.",
+      "sub_confirm_free": "Dois modos: Enter ou S.",
+      "sub_confirm_fatal": "VFIO precisa da Intel.\nO modo S ainda funciona.",
+      "sub_holders": "Na RTX agora",
       "sub_scan": "Procurando quem segura a GPU",
       "process_none": "Nada segurando a placa",
-      "btn_vfio": "Enter · VFIO + Looking Glass",
-      "btn_vfio_hint_busy": "Encerra o que está na RTX",
-      "btn_vfio_hint_free": "Passthrough da RTX",
-      "btn_shared": "S · Looking Glass (RTX no Linux)",
-      "btn_shared_hint": "Mesmo visor, sem exclusividade da GPU",
+      "btn_vfio": "Enter · VFIO",
+      "btn_vfio_hint_busy": "Encerra o que está na placa.\nA RTX vai para o Windows.",
+      "btn_vfio_hint_free": "A RTX vai para o Windows.\nO Linux fica na Intel.",
+      "btn_shared": "S · 1920×1080",
+      "btn_shared_hint": "A RTX fica no Linux.\nWindows em 1920×1080.",
       "err_gpu_read": "Falha ao ler a GPU.",
       "err_vm_start": "A VM não iniciou."
     },
@@ -41,15 +43,17 @@ Item {
       "title_confirm": "How should Windows 11 start?",
       "title_confirm_fatal": "VFIO unavailable",
       "title_scan": "Scanning GPU",
-      "sub_pick": "VFIO uses the RTX; Looking Glass without passthrough leaves it on Linux.",
-      "sub_confirm_free": "RTX is free · pick a profile",
+      "sub_pick": "Two modes: Enter or S.",
+      "sub_confirm_free": "Two modes: Enter or S.",
+      "sub_confirm_fatal": "VFIO needs Intel.\nS mode still works.",
+      "sub_holders": "On the RTX now",
       "sub_scan": "Looking for GPU holders",
       "process_none": "Nothing is holding the GPU",
-      "btn_vfio": "Enter · VFIO + Looking Glass",
-      "btn_vfio_hint_busy": "Stops whatever is using the RTX",
-      "btn_vfio_hint_free": "RTX passthrough",
-      "btn_shared": "S · Looking Glass (RTX on Linux)",
-      "btn_shared_hint": "Same viewer, GPU stays on the host",
+      "btn_vfio": "Enter · VFIO",
+      "btn_vfio_hint_busy": "Stops whatever is using the card.\nThe RTX goes to Windows.",
+      "btn_vfio_hint_free": "The RTX goes to Windows.\nLinux stays on Intel.",
+      "btn_shared": "S · 1920×1080",
+      "btn_shared_hint": "The RTX stays on Linux.\nWindows at 1920×1080.",
       "err_gpu_read": "Could not read the GPU.",
       "err_vm_start": "The VM did not start."
     }
@@ -103,7 +107,8 @@ Item {
   readonly property string uiFont: Style.font.family
   readonly property int hudWidth: Style.space(340)
   readonly property int glyphSize: Style.space(78)
-  readonly property string glyphIcon: "\u{F05B3}"
+  readonly property int heroHeight: Style.space(118)
+  readonly property url heroUrl: Qt.resolvedUrl("assets/hero.jpg")
 
   readonly property string title: phase === "ok" ? (goMode === "shared" ? tr("title_ok_shared") : tr("title_ok_vfio"))
     : phase === "fail" ? tr("title_fail")
@@ -118,8 +123,7 @@ Item {
     : phase === "blocked" ? tr("sub_blocked")
     : phase === "go" ? (goMode === "shared" ? tr("sub_go_shared") : tr("sub_go_vfio"))
     : phase === "confirm" && fatal ? tr("sub_confirm_fatal")
-    : phase === "confirm" && groups && groups.length ? (processLine + " — " + tr("sub_pick"))
-    : phase === "confirm" ? tr("sub_confirm_free")
+    : phase === "confirm" ? tr("sub_pick")
     : tr("sub_scan")
 
   readonly property string processLine: {
@@ -193,7 +197,7 @@ Item {
     if (data.mode) goMode = data.mode
     phase = "ok"
     successAnim.restart()
-    Quickshell.execDetached([root.pluginDir + "/bin/view-lg"])
+    Quickshell.execDetached([root.pluginDir + "/bin/" + (goMode === "shared" ? "view-shared" : "view-lg")])
     hideTimer.interval = 1600
     hideTimer.restart()
   }
@@ -401,16 +405,16 @@ Item {
 
         Item {
           id: stage
-          width: root.glyphSize * 1.5
-          height: root.glyphSize * 1.3
+          width: parent.width
+          height: root.heroHeight
           anchors.horizontalCenter: parent.horizontalCenter
 
           Rectangle {
             id: ripple
             property real progress: 0
             anchors.centerIn: parent
-            width: root.glyphSize * (0.86 + 0.5 * progress)
-            height: width
+            width: parent.width * (0.92 + 0.12 * progress)
+            height: parent.height * (0.92 + 0.12 * progress)
             radius: Style.cornerRadius
             color: "transparent"
             border.width: Math.max(1, Style.space(2))
@@ -420,24 +424,42 @@ Item {
 
           Item {
             id: face
-            anchors.centerIn: parent
-            width: root.glyphSize
-            height: root.glyphSize
-            opacity: 1 - frame.morph
-            scale: (1 - 0.06 * glyph.breathe) * (1 - 0.2 * frame.morph)
-            Text {
-              anchors.centerIn: parent
-              textFormat: Text.PlainText
-              text: root.glyphIcon
-              font.family: Style.font.family
-              font.pixelSize: root.glyphSize
-              color: root.tone
-              Behavior on color { ColorAnimation { duration: 220 } }
+            anchors.fill: parent
+            opacity: 1 - frame.morph * 0.45
+            scale: (1 - 0.02 * glyph.breathe) * (1 - 0.08 * frame.morph)
+
+            Image {
+              id: hero
+              anchors.fill: parent
+              source: root.heroUrl
+              fillMode: Image.PreserveAspectCrop
+              asynchronous: true
+              cache: true
+              layer.enabled: true
+              layer.effect: MultiEffect {
+                maskEnabled: true
+                maskSource: heroMask
+              }
             }
+
+            Rectangle {
+              id: heroMask
+              anchors.fill: hero
+              radius: Style.cornerRadius
+              visible: false
+              layer.enabled: true
+            }
+
+            Rectangle {
+              anchors.fill: hero
+              radius: Style.cornerRadius
+              color: "transparent"
+              border.width: 1
+              border.color: Util.alpha(Color.popups.text, 0.18)
+            }
+
             Item {
-              anchors.centerIn: parent
-              width: root.glyphSize * 0.86
-              height: width
+              anchors.fill: parent
               clip: true
               visible: root.scanning
               Rectangle {
@@ -446,7 +468,7 @@ Item {
                 y: glyph.beam * parent.height - height / 2
                 gradient: Gradient {
                   GradientStop { position: 0; color: Util.alpha(Color.accent, 0) }
-                  GradientStop { position: 0.5; color: Util.alpha(Color.accent, 0.26) }
+                  GradientStop { position: 0.5; color: Util.alpha(Color.accent, 0.28) }
                   GradientStop { position: 1; color: Util.alpha(Color.accent, 0) }
                 }
               }
@@ -556,11 +578,34 @@ Item {
           textFormat: Text.PlainText
           text: root.subtitle
           width: parent.width
-          wrapMode: Text.Wrap
+          wrapMode: Text.WordWrap
           horizontalAlignment: Text.AlignHCenter
+          lineHeight: 1.2
+          lineHeightMode: Text.ProportionalHeight
           font.family: root.uiFont
           font.pixelSize: Style.font.bodySmall
           color: Util.alpha(Color.popups.text, 0.6)
+        }
+
+        Item {
+          width: 1
+          height: Style.space(6)
+          visible: root.phase === "confirm" && root.groups && root.groups.length
+        }
+
+        Text {
+          visible: root.phase === "confirm" && root.groups && root.groups.length
+          anchors.horizontalCenter: parent.horizontalCenter
+          width: parent.width
+          wrapMode: Text.WordWrap
+          horizontalAlignment: Text.AlignHCenter
+          textFormat: Text.PlainText
+          text: root.tr("sub_holders") + "\n" + root.processLine
+          font.family: root.uiFont
+          font.pixelSize: Style.font.caption
+          lineHeight: 1.25
+          lineHeightMode: Text.ProportionalHeight
+          color: Util.alpha(Color.popups.text, 0.55)
         }
 
         Item { width: 1; height: Style.space(12) }
@@ -620,7 +665,7 @@ Item {
               spacing: Style.space(2)
               Text {
                 width: parent.width
-                wrapMode: Text.Wrap
+                wrapMode: Text.WordWrap
                 horizontalAlignment: Text.AlignHCenter
                 text: root.tr("btn_vfio")
                 font.family: root.uiFont
@@ -630,12 +675,14 @@ Item {
               }
               Text {
                 width: parent.width
-                wrapMode: Text.Wrap
+                wrapMode: Text.WordWrap
                 horizontalAlignment: Text.AlignHCenter
                 visible: text.length > 0
                 text: root.groups && root.groups.length ? root.tr("btn_vfio_hint_busy") : root.tr("btn_vfio_hint_free")
                 font.family: root.uiFont
                 font.pixelSize: Style.font.caption
+                lineHeight: 1.25
+                lineHeightMode: Text.ProportionalHeight
                 color: Util.alpha(Color.popups.text, 0.7)
               }
             }
@@ -660,7 +707,7 @@ Item {
               spacing: Style.space(2)
               Text {
                 width: parent.width
-                wrapMode: Text.Wrap
+                wrapMode: Text.WordWrap
                 horizontalAlignment: Text.AlignHCenter
                 text: root.tr("btn_shared")
                 font.family: root.uiFont
@@ -670,11 +717,13 @@ Item {
               }
               Text {
                 width: parent.width
-                wrapMode: Text.Wrap
+                wrapMode: Text.WordWrap
                 horizontalAlignment: Text.AlignHCenter
                 text: root.tr("btn_shared_hint")
                 font.family: root.uiFont
                 font.pixelSize: Style.font.caption
+                lineHeight: 1.25
+                lineHeightMode: Text.ProportionalHeight
                 color: Util.alpha(Color.popups.text, 0.7)
               }
             }

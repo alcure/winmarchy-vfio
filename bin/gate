@@ -2,6 +2,7 @@
 """GPU holders for the Winmarchy VFIO Omarchy overlay."""
 from __future__ import annotations
 
+import base64
 import glob
 import json
 import os
@@ -14,8 +15,6 @@ from pathlib import Path
 GPU = os.environ.get("WIN11_VFIO_GPU", "0000:01:00.0")
 VM = os.environ.get("WIN11_VFIO_VM", "win11")
 VM_SHARED = os.environ.get("WIN11_VFIO_VM_SHARED", "win11-shared")
-SHARED_WIDTH, SHARED_HEIGHT = 1920, 1080
-VFIO_WIDTH, VFIO_HEIGHT = 3440, 1440
 PLUGIN_DIR = Path(__file__).resolve().parent.parent
 CONFIG = Path.home() / ".config/omarchy/winmarchy-vfio.json"
 STATE = Path.home() / ".local/state/omarchy/winmarchy-vfio.json"
@@ -350,7 +349,28 @@ def _tag(el) -> str:
     return el.tag.rsplit("}", 1)[-1]
 
 
+SHARED_WIDTH = 1920
+SHARED_HEIGHT = 1080
+
+
+def host_resolution() -> tuple[int, int]:
+    try:
+        env_w, env_h = os.environ.get("WIN11_SPICE_WIDTH"), os.environ.get("WIN11_SPICE_HEIGHT")
+        if env_w and env_h:
+            return int(env_w), int(env_h)
+        out = subprocess.check_output(["/usr/bin/hyprctl", "monitors", "-j"], text=True, timeout=5)
+        mons = json.loads(out)
+        if not mons:
+            return 3440, 1440
+        focused = next((m for m in mons if m.get("focused")), None)
+        pick = focused or max(mons, key=lambda m: int(m.get("width") or 0) * int(m.get("height") or 0))
+        return int(pick.get("width") or 3440), int(pick.get("height") or 1440)
+    except Exception:
+        return 3440, 1440
+
+
 def _set_shared_video(devices, ET) -> None:
+    width, height = SHARED_WIDTH, SHARED_HEIGHT
     for video in list(devices.findall("video")):
         devices.remove(video)
     video = ET.SubElement(devices, "video")
@@ -361,8 +381,8 @@ def _set_shared_video(devices, ET) -> None:
     accel = ET.SubElement(model, "acceleration")
     accel.set("accel3d", "no")
     res = ET.SubElement(model, "resolution")
-    res.set("x", str(SHARED_WIDTH))
-    res.set("y", str(SHARED_HEIGHT))
+    res.set("x", str(width))
+    res.set("y", str(height))
     for inp in list(devices.findall("input")):
         if inp.get("type") == "tablet":
             devices.remove(inp)
@@ -480,14 +500,41 @@ def wait_guest_agent(vm: str, seconds: float = 90) -> bool:
     return False
 
 
+def guest_write(vm: str, path: str, content: str) -> bool:
+    opened = _guest_agent(vm, {"execute": "guest-file-open", "arguments": {"path": path, "mode": "w"}})
+    if opened is None:
+        return False
+    handle = opened if isinstance(opened, int) else opened.get("handle", opened)
+    raw = content.encode("utf-8")
+    offset = 0
+    while offset < len(raw):
+        chunk = raw[offset : offset + 20480]
+        wrote = _guest_agent(
+            vm,
+            {
+                "execute": "guest-file-write",
+                "arguments": {"handle": handle, "buf-b64": base64.b64encode(chunk).decode("ascii")},
+            },
+        )
+        if not wrote:
+            _guest_agent(vm, {"execute": "guest-file-close", "arguments": {"handle": handle}})
+            return False
+        offset += int(wrote.get("count") or len(chunk))
+    _guest_agent(vm, {"execute": "guest-file-close", "arguments": {"handle": handle}})
+    return True
+
+
 def guest_pshell(vm: str, command: str, timeout: float = 40) -> bool:
+    remote = r"C:\ProgramData\winmarchy-run.ps1"
+    if not guest_write(vm, remote, command):
+        return False
     started = _guest_agent(
         vm,
         {
             "execute": "guest-exec",
             "arguments": {
                 "path": r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
-                "arg": ["-NoProfile", "-Command", command],
+                "arg": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", remote],
                 "capture-output": False,
             },
         },
@@ -506,21 +553,227 @@ def guest_pshell(vm: str, command: str, timeout: float = 40) -> bool:
 
 
 SHARED_DISPLAY_PS = r"""
-Get-PnpDevice -Class Display -ErrorAction SilentlyContinue | ForEach-Object {
+$ErrorActionPreference = 'SilentlyContinue'
+Get-PnpDevice -Class Display | ForEach-Object {
   $virtio = $_.FriendlyName -match 'VirtIO|Virtio|Red Hat'
-  $vdd = ($_.FriendlyName -match 'Virtual Display|Looking Glass|IVSHMEM') -or ($_.InstanceId -like 'ROOT\DISPLAY*')
-  if ($virtio) {
-    Enable-PnpDevice -InstanceId $_.InstanceId -Confirm:$false -ErrorAction SilentlyContinue
-  } elseif ($vdd) {
-    Disable-PnpDevice -InstanceId $_.InstanceId -Confirm:$false -ErrorAction SilentlyContinue
+  $vdd = ($_.FriendlyName -match 'Virtual Display') -or ($_.InstanceId -like 'ROOT\DISPLAY*')
+  if ($virtio) { Enable-PnpDevice -InstanceId $_.InstanceId -Confirm:$false }
+  elseif ($vdd) { Disable-PnpDevice -InstanceId $_.InstanceId -Confirm:$false }
+}
+exit 0
+"""
+
+NATIVE_DISPLAY_PS = r"""
+$ErrorActionPreference = 'SilentlyContinue'
+$ps1 = 'C:\ProgramData\winmarchy-native.ps1'
+@'
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class WmNat2 {
+  [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Ansi)]
+  public struct DEVMODE {
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst=32)] public string dmDeviceName;
+    public short dmSpecVersion, dmDriverVersion, dmSize, dmDriverExtra;
+    public int dmFields, dmPositionX, dmPositionY, dmDisplayOrientation, dmDisplayFixedOutput;
+    public short dmColor, dmDuplex, dmYResolution, dmTTOption, dmCollate;
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst=32)] public string dmFormName;
+    public short dmLogPixels;
+    public int dmBitsPerPel, dmPelsWidth, dmPelsHeight, dmDisplayFlags, dmDisplayFrequency;
+    public int dmICMMethod, dmICMIntent, dmMediaType, dmDitherType, dmReserved1, dmReserved2, dmPanningWidth, dmPanningHeight;
+  }
+  [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Ansi)]
+  public struct DISPLAY_DEVICE {
+    public int cb;
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst=32)] public string DeviceName;
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst=128)] public string DeviceString;
+    public int StateFlags;
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst=128)] public string DeviceID;
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst=128)] public string DeviceKey;
+  }
+  [DllImport("user32.dll")] public static extern bool EnumDisplayDevices(string a, uint i, ref DISPLAY_DEVICE d, uint f);
+  [DllImport("user32.dll")] public static extern bool EnumDisplaySettings(string dev, int mode, ref DEVMODE dm);
+  [DllImport("user32.dll")] public static extern int ChangeDisplaySettingsEx(string dev, ref DEVMODE dm, IntPtr w, int f, IntPtr p);
+  [DllImport("user32.dll", EntryPoint="ChangeDisplaySettingsEx")] public static extern int ChangeDisplaySettingsExNull(string dev, IntPtr dm, IntPtr w, int f, IntPtr p);
+  public static int Apply(int wantW, int wantH) {
+    string vdd = null; string virtio = null;
+    for (uint i = 0; i < 16; i++) {
+      DISPLAY_DEVICE dd = new DISPLAY_DEVICE();
+      dd.cb = Marshal.SizeOf(dd);
+      if (!EnumDisplayDevices(null, i, ref dd, 0)) break;
+      if (dd.DeviceString.IndexOf("Virtual Display") >= 0 || dd.DeviceString.IndexOf("Looking Glass") >= 0) vdd = dd.DeviceName;
+      if (dd.DeviceString.IndexOf("Red Hat") >= 0 || dd.DeviceString.IndexOf("VirtIO") >= 0) virtio = dd.DeviceName;
+    }
+    string target = virtio != null ? virtio : vdd;
+    if (target == null) return 2;
+    DEVMODE pick = new DEVMODE();
+    bool found = false; int bestHz = -1;
+    for (int m = 0; m < 400; m++) {
+      DEVMODE t = new DEVMODE();
+      t.dmSize = (short)Marshal.SizeOf(t);
+      if (!EnumDisplaySettings(target, m, ref t)) break;
+      if (t.dmPelsWidth == wantW && t.dmPelsHeight == wantH && t.dmDisplayFrequency >= bestHz) {
+        pick = t; found = true; bestHz = t.dmDisplayFrequency;
+      }
+    }
+    if (!found) return 3;
+    pick.dmSize = (short)Marshal.SizeOf(pick);
+    pick.dmPositionX = 0; pick.dmPositionY = 0;
+    pick.dmFields = 0x20 | 0x80000 | 0x100000 | 0x400000;
+    ChangeDisplaySettingsEx(target, ref pick, IntPtr.Zero, 0x01 | 0x10 | 0x10000000, IntPtr.Zero);
+    ChangeDisplaySettingsExNull(null, IntPtr.Zero, IntPtr.Zero, 0, IntPtr.Zero);
+    return 0;
   }
 }
+"@
+[WmNat2]::Apply(__WIDTH__, __HEIGHT__)
+'@ | Set-Content -LiteralPath $ps1 -Encoding UTF8
+$exp = Get-CimInstance Win32_Process -Filter "Name='explorer.exe'" | Select-Object -First 1
+if ($exp) {
+  $own = Invoke-CimMethod -InputObject $exp -MethodName GetOwner
+  $ru = if ($own.Domain) { "$($own.Domain)\$($own.User)" } else { $own.User }
+  Unregister-ScheduledTask -TaskName 'WinmarchyNative' -Confirm:$false
+  $action = New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$ps1`""
+  $principal = New-ScheduledTaskPrincipal -UserId $ru -LogonType Interactive -RunLevel Highest
+  Register-ScheduledTask -TaskName 'WinmarchyNative' -Action $action -Principal $principal -Force | Out-Null
+  if (-not ('WmSessRun' -as [type])) {
+    Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+public class WmSessRun {
+  [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]
+  public struct STARTUPINFO {
+    public int cb; public string lpReserved; public string lpDesktop; public string lpTitle;
+    public int dwX, dwY, dwXSize, dwYSize, dwXCountChars, dwYCountChars, dwFillAttribute, dwFlags;
+    public short wShowWindow, cbReserved2; public IntPtr lpReserved2, hStdInput, hStdOutput, hStdError;
+  }
+  [StructLayout(LayoutKind.Sequential)]
+  public struct PROCESS_INFORMATION { public IntPtr hProcess, hThread; public int dwProcessId, dwThreadId; }
+  [DllImport("kernel32.dll", SetLastError=true)] public static extern IntPtr OpenProcess(uint a, bool i, int pid);
+  [DllImport("advapi32.dll", SetLastError=true)] public static extern bool OpenProcessToken(IntPtr p, uint a, out IntPtr t);
+  [DllImport("advapi32.dll", SetLastError=true)] public static extern bool DuplicateTokenEx(IntPtr h, uint a, IntPtr t, int impersonation, int type, out IntPtr dup);
+  [DllImport("userenv.dll", SetLastError=true)] public static extern bool CreateEnvironmentBlock(out IntPtr env, IntPtr token, bool inherit);
+  [DllImport("userenv.dll", SetLastError=true)] public static extern bool DestroyEnvironmentBlock(IntPtr env);
+  [DllImport("advapi32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
+  public static extern bool CreateProcessAsUser(IntPtr h, string app, StringBuilder cmd, IntPtr pa, IntPtr ta, bool inherit, uint flags, IntPtr env, string dir, ref STARTUPINFO si, out PROCESS_INFORMATION pi);
+  [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr h);
+  public static int Run(int pid, string app, string cmdLine) {
+    IntPtr proc = OpenProcess(0x0400, false, pid);
+    if (proc == IntPtr.Zero) proc = OpenProcess(0x1000, false, pid);
+    if (proc == IntPtr.Zero) return 10;
+    IntPtr tok;
+    if (!OpenProcessToken(proc, 0x000B, out tok)) { CloseHandle(proc); return 11; }
+    IntPtr dup;
+    if (!DuplicateTokenEx(tok, 0xF01FF, IntPtr.Zero, 2, 1, out dup)) { CloseHandle(tok); CloseHandle(proc); return 12; }
+    IntPtr env; CreateEnvironmentBlock(out env, dup, false);
+    STARTUPINFO si = new STARTUPINFO(); si.cb = Marshal.SizeOf(si); si.lpDesktop = "winsta0\\default";
+    PROCESS_INFORMATION pi;
+    StringBuilder cmd = new StringBuilder(cmdLine);
+    bool ok = CreateProcessAsUser(dup, app, cmd, IntPtr.Zero, IntPtr.Zero, false, 0x410, env, null, ref si, out pi);
+    int err = ok ? 0 : Marshal.GetLastWin32Error();
+    if (env != IntPtr.Zero) DestroyEnvironmentBlock(env);
+    CloseHandle(dup); CloseHandle(tok); CloseHandle(proc);
+    if (ok) { CloseHandle(pi.hThread); CloseHandle(pi.hProcess); }
+    return err;
+  }
+}
+"@
+  }
+  [WmSessRun]::Run([int]$exp.ProcessId, "$env:SystemRoot\System32\schtasks.exe", "schtasks.exe /Run /TN WinmarchyNative")
+}
+exit 0
 """
 
 VFIO_DISPLAY_PS = r"""
 Get-PnpDevice -Class Display -ErrorAction SilentlyContinue |
   Where-Object { $_.FriendlyName -match 'Virtual Display|Looking Glass|IVSHMEM' -or $_.InstanceId -like 'ROOT\DISPLAY*' } |
   ForEach-Object { Enable-PnpDevice -InstanceId $_.InstanceId -Confirm:$false -ErrorAction SilentlyContinue }
+"""
+
+# DXGI only works in the interactive logon session. The Looking Glass Windows
+# service runs in session 0 and never produces frames. A logon task with
+# highest privileges starts looking-glass-host.exe without a UAC prompt.
+# Start-ScheduledTask from the guest agent runs in session 0 (DXGI = Basic Render).
+# Register an elevated logon task, then ask Explorer's session to `schtasks /Run`.
+LG_HOST_AUTOSTART_PS = r"""
+$ErrorActionPreference = 'SilentlyContinue'
+$lg = 'C:\Program Files\Looking Glass (host)\looking-glass-host.exe'
+if (-not (Test-Path -LiteralPath $lg)) { exit 0 }
+$svc = Get-Service -DisplayName 'Looking Glass (host)' -ErrorAction SilentlyContinue
+if (-not $svc) { $svc = Get-Service -Name 'looking-glass-host' -ErrorAction SilentlyContinue }
+if ($svc) {
+  Stop-Service -Name $svc.Name -Force
+  Set-Service -Name $svc.Name -StartupType Disabled
+}
+$deadline = (Get-Date).AddSeconds(70)
+$exp = $null
+while ((Get-Date) -lt $deadline) {
+  $exp = Get-CimInstance Win32_Process -Filter "Name='explorer.exe'" | Select-Object -First 1
+  if ($exp) { break }
+  Start-Sleep -Seconds 2
+}
+if (-not $exp) { exit 0 }
+$own = Invoke-CimMethod -InputObject $exp -MethodName GetOwner
+$ru = if ($own.Domain) { "$($own.Domain)\$($own.User)" } else { $own.User }
+if (-not $ru) { exit 0 }
+Unregister-ScheduledTask -TaskName 'WinmarchyLgHost' -Confirm:$false
+$action = New-ScheduledTaskAction -Execute $lg -WorkingDirectory 'C:\Program Files\Looking Glass (host)'
+$trigger = New-ScheduledTaskTrigger -AtLogOn -User $ru
+$trigger.Delay = 'PT10S'
+$principal = New-ScheduledTaskPrincipal -UserId $ru -LogonType Interactive -RunLevel Highest
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -DontStopOnIdleEnd -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero)
+Register-ScheduledTask -TaskName 'WinmarchyLgHost' -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
+$startupDir = "C:\Users\$($own.User)\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup"
+if (Test-Path -LiteralPath $startupDir) {
+  Set-Content -LiteralPath "$startupDir\WinmarchyLgHost.cmd" -Encoding ASCII -Value "@echo off`r`ntimeout /t 8 /nobreak >nul`r`nschtasks /run /tn WinmarchyLgHost`r`n"
+}
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+public class WmSessRun {
+  [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]
+  public struct STARTUPINFO {
+    public int cb; public string lpReserved; public string lpDesktop; public string lpTitle;
+    public int dwX, dwY, dwXSize, dwYSize, dwXCountChars, dwYCountChars, dwFillAttribute, dwFlags;
+    public short wShowWindow, cbReserved2; public IntPtr lpReserved2, hStdInput, hStdOutput, hStdError;
+  }
+  [StructLayout(LayoutKind.Sequential)]
+  public struct PROCESS_INFORMATION { public IntPtr hProcess, hThread; public int dwProcessId, dwThreadId; }
+  [DllImport("kernel32.dll", SetLastError=true)] public static extern IntPtr OpenProcess(uint a, bool i, int pid);
+  [DllImport("advapi32.dll", SetLastError=true)] public static extern bool OpenProcessToken(IntPtr p, uint a, out IntPtr t);
+  [DllImport("advapi32.dll", SetLastError=true)] public static extern bool DuplicateTokenEx(IntPtr h, uint a, IntPtr t, int impersonation, int type, out IntPtr dup);
+  [DllImport("userenv.dll", SetLastError=true)] public static extern bool CreateEnvironmentBlock(out IntPtr env, IntPtr token, bool inherit);
+  [DllImport("userenv.dll", SetLastError=true)] public static extern bool DestroyEnvironmentBlock(IntPtr env);
+  [DllImport("advapi32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
+  public static extern bool CreateProcessAsUser(IntPtr h, string app, StringBuilder cmd, IntPtr pa, IntPtr ta, bool inherit, uint flags, IntPtr env, string dir, ref STARTUPINFO si, out PROCESS_INFORMATION pi);
+  [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr h);
+  public static int Run(int pid, string app, string cmdLine) {
+    IntPtr proc = OpenProcess(0x0400, false, pid);
+    if (proc == IntPtr.Zero) proc = OpenProcess(0x1000, false, pid);
+    if (proc == IntPtr.Zero) return 10;
+    IntPtr tok;
+    if (!OpenProcessToken(proc, 0x000B, out tok)) { CloseHandle(proc); return 11; }
+    IntPtr dup;
+    if (!DuplicateTokenEx(tok, 0xF01FF, IntPtr.Zero, 2, 1, out dup)) { CloseHandle(tok); CloseHandle(proc); return 12; }
+    IntPtr env; CreateEnvironmentBlock(out env, dup, false);
+    STARTUPINFO si = new STARTUPINFO(); si.cb = Marshal.SizeOf(si); si.lpDesktop = "winsta0\\default";
+    PROCESS_INFORMATION pi;
+    StringBuilder cmd = new StringBuilder(cmdLine);
+    bool ok = CreateProcessAsUser(dup, app, cmd, IntPtr.Zero, IntPtr.Zero, false, 0x410, env, null, ref si, out pi);
+    int err = ok ? 0 : Marshal.GetLastWin32Error();
+    if (env != IntPtr.Zero) DestroyEnvironmentBlock(env);
+    CloseHandle(dup); CloseHandle(tok); CloseHandle(proc);
+    if (ok) { CloseHandle(pi.hThread); CloseHandle(pi.hProcess); }
+    return err;
+  }
+}
+"@
+Get-Process -Name 'looking-glass-host' | Stop-Process -Force
+Start-Sleep -Milliseconds 400
+[WmSessRun]::Run([int]$exp.ProcessId, "$env:SystemRoot\System32\schtasks.exe", "schtasks.exe /Run /TN WinmarchyLgHost")
+exit 0
 """
 
 
@@ -533,8 +786,13 @@ def prepare_display(mode: str) -> dict:
         return {"ok": False, "error": "guest agent timeout"}
     cmd = SHARED_DISPLAY_PS if mode == "shared" else VFIO_DISPLAY_PS
     ok = guest_pshell(vm, cmd, timeout=90)
-    log(f"prepare-display {mode} ok={ok}")
-    return {"ok": ok}
+    if mode == "shared":
+        native = NATIVE_DISPLAY_PS.replace("__WIDTH__", str(SHARED_WIDTH)).replace("__HEIGHT__", str(SHARED_HEIGHT))
+        ok = guest_pshell(vm, native, timeout=90) or ok
+        time.sleep(3)
+    lg_ok = guest_pshell(vm, LG_HOST_AUTOSTART_PS, timeout=90)
+    log(f"prepare-display {mode} ok={ok} lg-host={lg_ok}")
+    return {"ok": bool(ok or lg_ok)}
 
 
 def spawn_prepare_display(mode: str) -> None:

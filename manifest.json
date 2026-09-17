@@ -2,11 +2,11 @@
   "schemaVersion": 1,
   "id": "psycrow.winmarchy",
   "name": "Winmarchy VFIO",
-  "version": "1.3.1",
+  "version": "1.4.0",
   "author": "psycrow",
   "license": "MIT",
   "homepage": "https://github.com/alcure/winmarchy-vfio",
-  "description": "Omarchy overlay for Windows 11: VFIO + Looking Glass, or Looking Glass without passthrough so the RTX stays on Linux. Overlay do Omarchy: VFIO ou Looking Glass com a RTX no host. Languages: pt-BR, en-US.",
+  "description": "Omarchy overlay for Windows 11: VFIO + Looking Glass, or 1920×1080 SPICE so the RTX stays on Linux. Overlay do Omarchy: VFIO/Looking Glass ou 1920×1080 com a RTX no host. Languages: pt-BR, en-US.",
   "kinds": ["overlay"],
   "keepLoaded": true,
   "entryPoints": {

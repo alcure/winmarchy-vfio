@@ -32,20 +32,24 @@ print("5900")
 PY
 )"
 
+# Shared guest is 1920x1080. Scale up with side bars; never squash 16:9 to 21:9.
 exec looking-glass-client \
   -F \
   -m KEY_F12 \
   egl:vsync=no \
+  egl:scale=1 \
+  wayland:fractionScale=no \
   win:jitRender=yes \
-  win:keepAspect=no \
-  win:forceAspect=no \
-  win:autoResize=no \
+  win:keepAspect=yes \
+  win:forceAspect=yes \
+  win:dontUpscale=no \
+  win:fpsMin=-1 \
+  input:rawMouse=yes \
+  input:mouseSmoothing=no \
   input:grabKeyboard=yes \
   input:grabKeyboardOnFocus=no \
   input:captureOnFocus=no \
-  input:rawMouse=yes \
-  input:mouseSmoothing=no \
   spice:port="${spice_port}" \
-  spice:scaleCursor=yes \
+  spice:scaleCursor=no \
   spice:captureOnStart=no \
   "$@"

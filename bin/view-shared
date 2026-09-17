@@ -1,0 +1,11 @@
+#!/bin/bash
+# Shared profile: VirtIO 1920x1080 over SPICE. Do not pass --full-screen:
+# virt-viewer would then resize the guest to the ultrawide host.
+# Looking Glass Host has no DXGI GPU here (RTX stays on Linux).
+set -euo pipefail
+pkill -f 'looking-glass-client' 2>/dev/null || true
+exec virt-viewer \
+  --connect qemu:///system \
+  --auto-resize=never \
+  --hotkeys=toggle-fullscreen=shift+f11,release-cursor=f12 \
+  win11-shared
